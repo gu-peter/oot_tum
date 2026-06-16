@@ -1,0 +1,91 @@
+#
+# Copyright 2026 Ettus Research, a National Instruments Brand
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
+#
+
+##################################################
+# RFNoC Block Sources
+##################################################
+# Here, list all the files that are necessary to synthesize this block. Don't
+# include testbenches!
+# Make sure that the source files are nicely detectable by a regex. Best to put
+# one on each line.
+# The first argument to addprefix is the current path to this Makefile, so the
+# path list is always absolute, regardless of from where we're including or
+# calling this file. RFNOC_OOT_SRCS needs to be a simply expanded variable
+# (not a recursively expanded variable), and we take care of that in the build
+# infrastructure.
+RFNOC_BLOCK_OFDM_TX_SL_SRCS := $(addprefix $(dir $(abspath $(lastword $(MAKEFILE_LIST)))), \
+rfnoc_block_ofdm_tx_sl.sv \
+noc_shell_ofdm_tx_sl.sv \
+OFDM_Transmitter_pkg.sv \
+OFDM_Transmitter.sv \
+BPSK_Modulator.sv \
+Complex4Multiply.sv \
+Complex4Multiply_block.sv \
+Complex4Multiply_block1.sv \
+Complex_Saturate.sv \
+CPAddition.sv \
+Data.sv \
+dsphdl_IFFT.sv \
+FIFO.sv \
+Frame_Counter.sv \
+FWFT_FIFO.sv \
+fwft_logic.sv \
+Gold_Sequence_Generator.sv \
+Grid_Contents.sv \
+Grid_Structure.sv \
+HDLFFTShiftMod.sv \
+LFSR1.sv \
+LFSR2.sv \
+MATLAB_Function.sv \
+Multiplex_Grid.sv \
+Multiplex_QPSK.sv \
+num_out_calc.sv \
+OFDM_Mod_Scaling.sv \
+OFDM_Modulator.sv \
+QPSK_Modulator.sv \
+RADIX22FFT_CTRL1_1.sv \
+RADIX22FFT_CTRL1_2.sv \
+RADIX22FFT_CTRL1_3.sv \
+RADIX22FFT_CTRL1_4.sv \
+RADIX22FFT_CTRL1_5.sv \
+RADIX22FFT_CTRL1_6.sv \
+RADIX22FFT_CTRL1_7.sv \
+RADIX22FFT_CTRL1_8.sv \
+RADIX22FFT_SDF1_1.sv \
+RADIX22FFT_SDF1_3.sv \
+RADIX22FFT_SDF1_5.sv \
+RADIX22FFT_SDF1_7.sv \
+RADIX22FFT_SDF2_2.sv \
+RADIX22FFT_SDF2_4.sv \
+RADIX22FFT_SDF2_6.sv \
+RADIX22FFT_SDF2_8.sv \
+RADIX2FFT_bitNatural.sv \
+Reference.sv \
+Resource_Element_Type.sv \
+SDFCommutator1.sv \
+SDFCommutator2.sv \
+SDFCommutator3.sv \
+SDFCommutator4.sv \
+SDFCommutator5.sv \
+SDFCommutator6.sv \
+SDFCommutator7.sv \
+SDFCommutator8.sv \
+SetFF.sv \
+shiftMasks.sv \
+shiftMasksConst.sv \
+SimpleDualPortRAM_generic.sv \
+SimpleDualPortRAM_generic_block.sv \
+sr_latch.sv \
+sr_latch1.sv \
+sr_latch2.sv \
+symbolFormation.sv \
+Symbol_Modulation.sv \
+Synchronization_Sequence.sv \
+TWDLROM_3_1.sv \
+TWDLROM_5_1.sv \
+TWDLROM_7_1.sv \
+WindowingSysObj.sv \
+)
