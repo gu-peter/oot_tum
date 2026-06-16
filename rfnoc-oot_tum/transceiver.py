@@ -10,16 +10,19 @@ All ports of either one or two daughter boards can be used in this example. The
 transmitted and received data is plotted as time-domain IQ waveforms.
 """
 
+import time
 import matplotlib.pyplot as plt
 import numpy as np
 import uhd
+from rfnoc_oot_tum import OfdmTxSlBlockControl
+
 
 # --- Configuration ---
 DEVICE_ARGS = "addr=10.157.161.243, master_clock_rate=250e6"
-NUM_SAMPLES = 1024
+NUM_SAMPLES = 40812  # 81624 bits / 2 bits per QPSK sample
 BITS = np.random.randint(0, 2, 2 * NUM_SAMPLES)  # 2 bits per QPSK symbol
 AMPLITUDE = 0.5
-CHANNELS = [0]
+CHANNELS = [0, 1]
 LOOPBACK = True
 DELAY = 56     # FPGA clock cycles to delay RX vs. TX (None = auto)
 TX_GAIN = 15   # dB
@@ -27,7 +30,8 @@ RX_GAIN = 50   # dB
 FREQ = 1.5e9   # Hz
 
 graph_connections = {
-    0: {"tx": ("0/Radio#0", 1), "rx": ("0/Radio#0", 1)},
+    0: {"tx": [("0/Radio#0", 1)], "rx": [("0/Radio#0", 1)]},
+    1: {"tx": [("0/Ofdm_tx_sl#0", 0, "0/Radio#0", 0)], "rx": [("0/Radio#0", 0)]},
 }
 
 
@@ -50,6 +54,8 @@ def create_block_controller(block):
     name = block.get_unique_id()
     if name[2:].startswith("Radio"):
         block = uhd.rfnoc.RadioControl(block)
+    elif name[2:].startswith("Ofdm_tx_sl"):
+        block = OfdmTxSlBlockControl(block)
     else:
         raise NotImplementedError(f"Cannot create controller for block {name}")
     return block
@@ -60,16 +66,62 @@ def connect_graph(graph, graph_connections, channels=[], tx_streamer=None, rx_st
     controllers = dict()
     for chan_idx, chan in enumerate(channels):
         for direction in ["tx", "rx"]:
-            name, port = graph_connections[chan][direction]
-            if name not in controllers:
-                controllers[name] = create_block_controller(graph.get_block(name))
-            blk_id = controllers[name].get_unique_id()
-            if direction == "tx" and tx_streamer is not None:
-                print(f"    TX streamer/port{chan_idx} -> {name}/port{port}")
-                graph.connect(tx_streamer, chan_idx, blk_id, port)
-            elif direction == "rx" and rx_streamer is not None:
-                print(f"    {name}/port{port} -> RX streamer/port{chan_idx}")
-                graph.connect(blk_id, port, rx_streamer, chan_idx)
+            print(f"Connections for channel {chan}/{direction.upper()}:")
+            connections = graph_connections[chan][direction]
+            for idx, conn in enumerate(connections):
+                # Normalize tuple lengths:
+                #   2-tuple: (block, port)                            — direct streamer connection
+                #   4-tuple: (src, src_p, dst, dst_p)                — no converter
+                #   6-tuple: (src, src_p, cvtr, cvtr_p, dst, dst_p) — with optional converter
+                if len(conn) == 2:
+                    src_name, src_idx = conn
+                    dst_name, dst_idx = conn
+                    cvtr_name, _ = None, None
+                elif len(conn) == 4:
+                    src_name, src_idx, dst_name, dst_idx = conn
+                    cvtr_name, _ = None, None
+                elif len(conn) == 6:
+                    src_name, src_idx, cvtr_name, _, dst_name, dst_idx = conn
+                else:
+                    raise ValueError(f"Connection tuple must have 2, 4, or 6 elements, got {len(conn)}: {conn}")
+                first = idx == 0
+                last = idx == (len(connections) - 1)
+                if src_name not in controllers:
+                    controllers[src_name] = create_block_controller(graph.get_block(src_name))
+                if dst_name not in controllers:
+                    controllers[dst_name] = create_block_controller(graph.get_block(dst_name))
+                if direction == "tx" and first and tx_streamer is not None:
+                    print(f"    TX streamer/port{chan_idx} -> {src_name}/port{src_idx}")
+                    graph.connect(
+                        tx_streamer,
+                        chan_idx,
+                        controllers[src_name].get_unique_id(),
+                        src_idx,
+                    )
+                # skip src->dst link when the 2-tuple shorthand points the same block/port
+                if src_name != dst_name or src_idx != dst_idx:
+                    print(f"    {src_name}/port{src_idx} -> {dst_name}/port{dst_idx}")
+                    uhd.rfnoc.connect_through_blocks(
+                        graph,
+                        controllers[src_name].get_unique_id(),
+                        src_idx,
+                        controllers[dst_name].get_unique_id(),
+                        dst_idx,
+                    )
+                if cvtr_name is not None:
+                    try:
+                        controllers[cvtr_name] = create_block_controller(graph.get_block(cvtr_name))
+                    except RuntimeError:
+                        pass
+                if direction == "rx" and last and rx_streamer is not None:
+                    # connect RX streamer
+                    print(f"    {dst_name}/port{dst_idx} -> RX streamer/port{chan_idx}")
+                    graph.connect(
+                        controllers[dst_name].get_unique_id(),
+                        dst_idx,
+                        rx_streamer,
+                        chan_idx,
+                    )
     return (graph, controllers.values())
 
 

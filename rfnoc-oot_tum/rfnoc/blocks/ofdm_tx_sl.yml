@@ -48,13 +48,13 @@ data:
   # provided in the 'clocks' section.
   clk_domain: ce
   inputs:
-    # txPayload: 2 QPSK payload bits per clock cycle
+    # txPayload: 2 QPSK payload bits per clock cycle, packed as bit0/bit1 of a uint8
     txPayload:
-      item_width: 2
+      item_width: 8
       nipc: 1
       info_fifo_depth: 32
       payload_fifo_depth: 32
-      format: ufix2
+      format: uint8
   outputs:
     # txData: modulated I/Q samples
     txData:

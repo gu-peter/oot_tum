@@ -11,4 +11,4 @@ rfnoc-oot_tum: Example module for Python support of an RFNoC OOT Module
 from . import rfnoc_oot_tum_python as lib
 
 # In UHD, we use CamelCase for names in Python, so we'll do the same here
-#MyBlockControl = lib.my_block_control
+OfdmTxSlBlockControl = lib.ofdm_tx_sl_block_control
