@@ -213,7 +213,7 @@ def main():
     """Main function of the example."""
     num_chan = len(CHANNELS)
 
-    spp = min(NUM_SAMPLES, 1996)
+    spp = min(NUM_SAMPLES, 1024)
     print(f"Using samples per packet of {spp}")
 
     graph = uhd.rfnoc.RfnocGraph(DEVICE_ARGS)
