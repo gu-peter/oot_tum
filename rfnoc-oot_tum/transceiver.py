@@ -10,6 +10,7 @@ All ports of either one or two daughter boards can be used in this example. The
 transmitted and received data is plotted as time-domain IQ waveforms.
 """
 
+import threading
 import time
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,7 +20,7 @@ from rfnoc_oot_tum import OfdmTxSlBlockControl
 
 # --- Configuration ---
 DEVICE_ARGS = "addr=10.157.161.243, master_clock_rate=250e6"
-NUM_SAMPLES = 40812  # 81624 bits / 2 bits per QPSK sample
+NUM_SAMPLES = 40816  # 81624 bits / 2 bits per QPSK sample
 BITS = np.random.randint(0, 2, 2 * NUM_SAMPLES)  # 2 bits per QPSK symbol
 AMPLITUDE = 0.5
 CHANNELS = [0, 1]
@@ -180,6 +181,39 @@ def get_tx_rx_delay(radio, delay, loopback):
     return loopback_delay / tick_rate
 
 
+class TxPayloadReadyPoller:
+    """Poll a block's get_tx_payload_ready() in a background thread.
+
+    Records (relative_time, value) samples so the txPayloadReady status can be
+    plotted as a time series afterwards.
+    """
+
+    def __init__(self, ofdm, interval=0.001):
+        self._ofdm = ofdm
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+        self.times = []
+        self.values = []
+
+    def _run(self):
+        t0 = time.time()
+        while not self._stop.is_set():
+            self.times.append(time.time() - t0)
+            self.values.append(int(self._ofdm.get_tx_payload_ready()))
+            time.sleep(self._interval)
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+
+
 def transmit_and_receive(
     tx_streamer, rx_streamer, tx_time, data_in, rx_time, data_out_size, num_samps
 ):
@@ -218,10 +252,10 @@ def main():
 
     graph = uhd.rfnoc.RfnocGraph(DEVICE_ARGS)
 
-    tx_sa = uhd.usrp.StreamArgs("u8", "u8")
+    tx_sa = uhd.usrp.StreamArgs("s8", "s8")
     tx_sa.args = f"spp={spp}"
     tx_streamer = graph.create_tx_streamer(num_chan, tx_sa)
-    rx_sa = uhd.usrp.StreamArgs("u8", "u8")
+    rx_sa = uhd.usrp.StreamArgs("s8", "s8")
     rx_sa.args = f"spp={spp}"
     rx_streamer = graph.create_rx_streamer(num_chan, rx_sa)
 
@@ -246,17 +280,21 @@ def main():
     data_in = np.tile(data_in_row, (num_chan, 1))
     bits_in = np.stack([data_in & 0x01, (data_in >> 1) & 0x01])  # for plotting only
 
+    ofdm_blocks = [x for x in blocks if isinstance(x, OfdmTxSlBlockControl)]
+    ofdm = ofdm_blocks[0]
+
     radio = radio_blocks[0]
     tx_time = radio.get_time_now().get_real_secs() + 1.0
-    data_out = transmit_and_receive(
-        tx_streamer=tx_streamer,
-        rx_streamer=rx_streamer,
-        tx_time=tx_time,
-        rx_time=tx_time + get_tx_rx_delay(radio, DELAY, LOOPBACK),
-        data_in=data_in,
-        data_out_size=(num_chan, NUM_SAMPLES),
-        num_samps=NUM_SAMPLES,
-    )
+    with TxPayloadReadyPoller(ofdm) as ready_poller:
+        data_out = transmit_and_receive(
+            tx_streamer=tx_streamer,
+            rx_streamer=rx_streamer,
+            tx_time=tx_time,
+            rx_time=tx_time + get_tx_rx_delay(radio, DELAY, LOOPBACK),
+            data_in=data_in,
+            data_out_size=(num_chan, NUM_SAMPLES),
+            num_samps=NUM_SAMPLES,
+        )
 
     bits_out = np.stack([data_out & 0x01, (data_out >> 1) & 0x01])
 
@@ -274,6 +312,17 @@ def main():
         axes[1][chan_idx].plot(bits_out[1][chan_idx], label="bit1")
         axes[1][chan_idx].legend()
         axes[1][chan_idx].grid(True)
+
+    # Plot the txPayloadReady status sampled during transmit/receive
+    plt.figure(figsize=(14, 3))
+    plt.step(ready_poller.times, ready_poller.values, where="post")
+    plt.title("OFDM TX txPayloadReady")
+    plt.xlabel("Time (s)")
+    plt.ylabel("txPayloadReady")
+    plt.yticks([0, 1])
+    plt.ylim(-0.1, 1.1)
+    plt.grid(True)
+
     try:
         plt.show(block=True)
     except KeyboardInterrupt:

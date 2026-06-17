@@ -54,7 +54,7 @@ data:
       nipc: 1
       info_fifo_depth: 32
       payload_fifo_depth: 32
-      format: uint8
+      format: s8
   outputs:
     # txData: modulated I/Q samples
     txData:

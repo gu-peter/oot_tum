@@ -70,7 +70,7 @@ module rfnoc_block_ofdm_tx_sl #(
   reg                m_ctrlport_resp_ack;
   reg  [31:0]        m_ctrlport_resp_data;
   // Data Stream to User Logic: txPayload
-  wire [2*1-1:0]     m_txPayload_axis_tdata;
+  wire [8*1-1:0]     m_txPayload_axis_tdata;
   wire [1-1:0]       m_txPayload_axis_tkeep;
   wire               m_txPayload_axis_tlast;
   wire               m_txPayload_axis_tvalid;
