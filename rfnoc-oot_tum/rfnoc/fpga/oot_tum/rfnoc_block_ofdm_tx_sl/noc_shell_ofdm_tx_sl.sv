@@ -42,11 +42,13 @@ module noc_shell_ofdm_tx_sl #(
   input  wire rfnoc_chdr_clk,
   input  wire rfnoc_ctrl_clk,
   input  wire ce_clk,
+  input  wire ce_250_clk,
 
   // NoC Shell Generated Resets
   output wire rfnoc_chdr_rst,
   output wire rfnoc_ctrl_rst,
   output wire ce_rst,
+  output wire ce_250_rst,
 
   // AXIS-CHDR Input Ports (from framework)
   input  wire [(1)*CHDR_W-1:0] s_rfnoc_chdr_tdata,
@@ -168,6 +170,18 @@ module noc_shell_ofdm_tx_sl #(
     .pulse_in(ce_rst_pulse), .pulse_out(ce_rst)
   );
 
+  wire ce_250_rst_pulse;
+
+  pulse_synchronizer #(.MODE ("POSEDGE")) pulse_synchronizer_ce_250 (
+    .clk_a(rfnoc_chdr_clk), .rst_a(1'b0), .pulse_a (rfnoc_chdr_rst), .busy_a (),
+    .clk_b(ce_250_clk), .pulse_b (ce_250_rst_pulse)
+  );
+
+  pulse_stretch_min #(.LENGTH(32)) pulse_stretch_min_ce_250 (
+    .clk(ce_250_clk), .rst(1'b0),
+    .pulse_in(ce_250_rst_pulse), .pulse_out(ce_250_rst)
+  );
+
   //---------------------------------------------------------------------------
   //  Control Path
   //---------------------------------------------------------------------------
@@ -223,8 +237,8 @@ module noc_shell_ofdm_tx_sl #(
   //  Data Path
   //---------------------------------------------------------------------------
 
-  assign axis_data_clk = ce_clk;
-  assign axis_data_rst = ce_rst;
+  assign axis_data_clk = ce_250_clk;
+  assign axis_data_rst = ce_250_rst;
 
   //---------------------
   // Input Data Paths
