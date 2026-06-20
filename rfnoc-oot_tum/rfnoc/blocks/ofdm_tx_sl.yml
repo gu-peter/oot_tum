@@ -16,10 +16,22 @@ noc_id: 0xff2494ff
 
 # List all clocks required for this RFNoC block. rfnoc_chdr and rfnoc_ctrl
 # are always required and available.
+#
+# 'ce' is the 266.667 MHz compute-engine clock provided by the X440 BSP (it is
+# connected to this block via a clk_domain connection in the image core YAML).
+# 'ce_250' is a 250 MHz clock *generated inside this block* from 'ce' by a
+# Xilinx MMCM (see rfnoc_block_ofdm_tx_sl.sv). It is declared 'direction: out'
+# so the rfnoc_image_builder knows the block drives it (no clk_domain
+# connection is needed for an output clock) and could route it to other blocks.
+# The data path runs in this 250 MHz domain so the block's output sample rate
+# matches the downstream radio (250 MHz) instead of the 266.667 MHz ce clock.
 clocks:
   - name: rfnoc_chdr
   - name: rfnoc_ctrl
   - name: ce
+    direction: in
+  - name: ce_250
+    direction: out
 
 # A control interface is always required. This is used for the control
 # traffic between host software and this RFNoC block on the FPGA.
@@ -45,8 +57,9 @@ data:
   # The FPGA interface defines how the block IP handles data streams.
   fpga_iface: axis_data
   # The clock domain must be either rfnoc_chdr or an additional clock as
-  # provided in the 'clocks' section.
-  clk_domain: ce
+  # provided in the 'clocks' section. Use the block-generated 250 MHz clock so
+  # the data path is rate-matched to the downstream radio.
+  clk_domain: ce_250
   inputs:
     # txPayload: 2 QPSK payload bits per clock cycle, packed as bit0/bit1 of a uint8
     txPayload:
