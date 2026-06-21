@@ -88,4 +88,5 @@ TWDLROM_3_1.sv \
 TWDLROM_5_1.sv \
 TWDLROM_7_1.sv \
 WindowingSysObj.sv \
+ila_0/ila_0.xci \
 )

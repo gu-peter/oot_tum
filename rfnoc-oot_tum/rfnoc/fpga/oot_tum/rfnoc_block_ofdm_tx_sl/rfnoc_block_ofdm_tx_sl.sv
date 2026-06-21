@@ -28,6 +28,10 @@ module rfnoc_block_ofdm_tx_sl #(
   input  wire                   rfnoc_chdr_clk,
   input  wire                   rfnoc_ctrl_clk,
   input  wire                   ce_clk,
+  // 250 MHz data-path clock generated inside this block (MMCM, from ce_clk).
+  // Declared 'direction: out' in the block YAML, so the image core treats this
+  // as a block output and the block drives it.
+  output wire                   ce_250_clk,
   // AXIS-CHDR Input Ports (from framework)
   input  wire [(1)*CHDR_W-1:0] s_rfnoc_chdr_tdata,
   input  wire [(1)-1:0]        s_rfnoc_chdr_tlast,
@@ -62,6 +66,8 @@ module rfnoc_block_ofdm_tx_sl #(
   wire               ctrlport_rst;
   wire               axis_data_clk;
   wire               axis_data_rst;
+  wire               ce_250_rst;    // ce_250_clk-domain reset from the NoC shell
+  wire               ce_250_locked; // MMCM lock status for the 250 MHz clock
   // CtrlPort Master
   wire               m_ctrlport_req_wr;
   wire               m_ctrlport_req_rd;
@@ -70,27 +76,123 @@ module rfnoc_block_ofdm_tx_sl #(
   reg                m_ctrlport_resp_ack;
   reg  [31:0]        m_ctrlport_resp_data;
   // Data Stream to User Logic: txPayload
-  wire [8*1-1:0]     m_txPayload_axis_tdata;
+  // ILA debug: probe the payload bits as the core consumes them (ce_250 domain)
+  // to localize the data-dependent corruption -- if the consumed payload byte
+  // sequence (tdata when tvalid && tready, during data REs) matches the fed
+  // golden payload, the corruption is in the core/IFFT; if it jitters, it is the
+  // payload consumption/CDC handshake. mark_debug keeps these nets for the ILA.
+  (* mark_debug = "true" *) wire [8*1-1:0]     m_txPayload_axis_tdata;
   wire [1-1:0]       m_txPayload_axis_tkeep;
   wire               m_txPayload_axis_tlast;
-  wire               m_txPayload_axis_tvalid;
-  wire               m_txPayload_axis_tready;
+  (* mark_debug = "true" *) wire               m_txPayload_axis_tvalid;
+  (* mark_debug = "true" *) wire               m_txPayload_axis_tready;
   wire [63:0]        m_txPayload_axis_ttimestamp;
   wire               m_txPayload_axis_thas_time;
   wire [15:0]        m_txPayload_axis_tlength;
   wire               m_txPayload_axis_teov;
   wire               m_txPayload_axis_teob;
   // Data Stream from User Logic: txData
-  wire [32*1-1:0]    s_txData_axis_tdata;
+  (* mark_debug = "true" *) wire [32*1-1:0]    s_txData_axis_tdata;
   wire [1-1:0]       s_txData_axis_tkeep;
   wire               s_txData_axis_tlast;
-  wire               s_txData_axis_tvalid;
-  wire               s_txData_axis_tready;
+  (* mark_debug = "true" *) wire               s_txData_axis_tvalid;
+  (* mark_debug = "true" *) wire               s_txData_axis_tready;
   wire [63:0]        s_txData_axis_ttimestamp;
   wire               s_txData_axis_thas_time;
   wire [15:0]        s_txData_axis_tlength;
   wire               s_txData_axis_teov;
   wire               s_txData_axis_teob;
+
+  //---------------------------------------------------------------------------
+  // 250 MHz Data-Path Clock Generation
+  //---------------------------------------------------------------------------
+  //
+  // The X440 BSP supplies 'ce_clk' at 266.667 MHz, but the downstream radio
+  // runs at 250 MHz. Generate a 250 MHz clock from ce_clk with a Xilinx MMCM so
+  // the whole data path (the NoC-shell gearboxes and the OFDM core) runs at the
+  // radio's rate. This is the HDL that backs the 'ce_250' (direction: out)
+  // clock declared in the block YAML.
+  //
+  //   VCO = 266.667 MHz * 3.75            = 1000.0 MHz   (in 800-1600 range)
+  //   ce_250 = VCO / 4.0                  =  250.0 MHz
+  //
+  // The feedback is buffered through a BUFG (CLKFBOUT -> BUFG -> CLKFBIN), and
+  // the MMCM is reset from the ce_clk-domain reset. Downstream logic is held in
+  // reset until the MMCM locks (see ofdm_data_rst below), so the OFDM core
+  // never sees the 250 MHz clock before it is stable.
+  //---------------------------------------------------------------------------
+
+  wire ce_250_clk_unbuf;
+  wire ce_250_fb_unbuf;
+  wire ce_250_fb;
+
+  MMCME4_ADV #(
+    .BANDWIDTH          ("OPTIMIZED"),
+    .CLKOUT4_CASCADE    ("FALSE"),
+    .COMPENSATION       ("AUTO"),
+    .STARTUP_WAIT       ("FALSE"),
+    .DIVCLK_DIVIDE      (1),
+    .CLKFBOUT_MULT_F    (3.750),
+    .CLKFBOUT_PHASE     (0.000),
+    .CLKFBOUT_USE_FINE_PS ("FALSE"),
+    .CLKOUT0_DIVIDE_F   (4.000),
+    .CLKOUT0_PHASE      (0.000),
+    .CLKOUT0_DUTY_CYCLE (0.500),
+    .CLKOUT0_USE_FINE_PS ("FALSE"),
+    .CLKIN1_PERIOD      (3.750)
+  ) ce_250_mmcm_i (
+    // Output clocks
+    .CLKFBOUT     (ce_250_fb_unbuf),
+    .CLKFBOUTB    (),
+    .CLKOUT0      (ce_250_clk_unbuf),
+    .CLKOUT0B     (),
+    .CLKOUT1      (), .CLKOUT1B (),
+    .CLKOUT2      (), .CLKOUT2B (),
+    .CLKOUT3      (), .CLKOUT3B (),
+    .CLKOUT4      (),
+    .CLKOUT5      (),
+    .CLKOUT6      (),
+    // Input clock control
+    .CLKFBIN      (ce_250_fb),
+    .CLKIN1       (ce_clk),
+    .CLKIN2       (1'b0),
+    .CLKINSEL     (1'b1),
+    // Dynamic reconfiguration port (unused)
+    .DADDR        (7'h0),
+    .DCLK         (1'b0),
+    .DEN          (1'b0),
+    .DI           (16'h0),
+    .DO           (),
+    .DRDY         (),
+    .DWE          (1'b0),
+    .CDDCDONE     (),
+    .CDDCREQ      (1'b0),
+    // Dynamic phase shift (unused)
+    .PSCLK        (1'b0),
+    .PSEN         (1'b0),
+    .PSINCDEC     (1'b0),
+    .PSDONE       (),
+    // Status and control
+    .LOCKED       (ce_250_locked),
+    .CLKINSTOPPED (),
+    .CLKFBSTOPPED (),
+    .PWRDWN       (1'b0),
+    // Free-running derived clock: do not reset the MMCM on block resets, so
+    // ce_250_clk keeps toggling and the NoC shell's ce_250_rst synchronizer
+    // continues to work. Downstream logic is instead held off via the
+    // ce_250_locked gating below until the MMCM has locked.
+    .RST          (1'b0)
+  );
+
+  BUFG ce_250_fb_bufg_i (
+    .I (ce_250_fb_unbuf),
+    .O (ce_250_fb)
+  );
+
+  BUFG ce_250_bufg_i (
+    .I (ce_250_clk_unbuf),
+    .O (ce_250_clk)
+  );
 
   //---------------------------------------------------------------------------
   // NoC Shell
@@ -109,10 +211,12 @@ module rfnoc_block_ofdm_tx_sl #(
     .rfnoc_chdr_clk      (rfnoc_chdr_clk),
     .rfnoc_ctrl_clk      (rfnoc_ctrl_clk),
     .ce_clk              (ce_clk),
+    .ce_250_clk          (ce_250_clk),
     // Reset Outputs
     .rfnoc_chdr_rst      (),
     .rfnoc_ctrl_rst      (),
     .ce_rst              (),
+    .ce_250_rst          (ce_250_rst),
     // CHDR Input Ports  (from framework)
     .s_rfnoc_chdr_tdata  (s_rfnoc_chdr_tdata),
     .s_rfnoc_chdr_tlast  (s_rfnoc_chdr_tlast),
@@ -188,6 +292,11 @@ module rfnoc_block_ofdm_tx_sl #(
 
   // < Replace this section with your logic >
 
+  // Data-path reset for the 250 MHz (ce_250) domain. Combine the NoC-shell
+  // ce_250 reset with the MMCM lock status so the OFDM core and its
+  // axis-domain synchronizer stay in reset until the 250 MHz clock is stable.
+  wire axis_data_rst_locked = axis_data_rst | ~ce_250_locked;
+
   //---------------------------------------------------------------------------
   // Registers
   //---------------------------------------------------------------------------
@@ -228,7 +337,7 @@ module rfnoc_block_ofdm_tx_sl #(
     .FALSE_PATH_TO_IN (1)
   ) enable_sync_i (
     .clk (axis_data_clk),
-    .rst (axis_data_rst),
+    .rst (axis_data_rst_locked),
     .in  (reg_enable),
     .out (enable_axis_clk)
   );
@@ -277,14 +386,98 @@ module rfnoc_block_ofdm_tx_sl #(
   //
   //---------------------------------------------------------------------------
 
+  //---------------------------------------------------------------------------
+  // Frame-gated enable (one full frame at a time)
+  //---------------------------------------------------------------------------
+  //
+  // The OFDM_Transmitter core is free-running: once 'enable' is high its
+  // Frame_Counter advances every (clk_enable & enable) cycle, and the data
+  // resource elements pop the internal payload FIFO. If that FIFO underruns
+  // mid-frame (the host cannot sustain a gap-free payload stream), the core
+  // modulates stale samples -- the data symbols come out corrupted while the
+  // payload-independent sync/reference symbols stay correct (observed on
+  // hardware via the loopback ramp/constant tests).
+  //
+  // Fix: only let the core run while a *full frame* of payload is buffered.
+  // FWFT_FIFO drives txPayloadReady low once occupancy reaches one frame
+  // (fwft_logic_num_o >= 40812), so ~m_txPayload_axis_tready means "a complete
+  // frame is queued". The core's 'enable' input *holds* the Frame_Counter when
+  // low (it does not gate the payload push), so we can pause/resume the framer
+  // at frame boundaries without losing buffered payload. We mirror the core's
+  // Frame_Counter here -- identical advance condition (clk_enable & enable) and
+  // reset -- so we know exactly when its framer sits at a frame boundary, and
+  // gate 'enable' to start a frame only when one is fully buffered. Because a
+  // frame consumes exactly one frame of payload (179 data symbols x 228 = 40812)
+  // and we start with that buffered, the FIFO can never underrun mid-frame.
+  //
+  // Frame geometry mirrors Frame_Counter: subcarrier counter wraps at 320
+  // (RE/symbol = FFT 256 + CP 64), symbol counter wraps at 240 (symbols/frame).
+  localparam int RE_PER_SYM    = 320;
+  localparam int SYM_PER_FRAME = 240;
+
+  wire frame_buffered = ~m_txPayload_axis_tready;     // occupancy >= one frame
+  (* mark_debug = "true" *) reg  run_frame = 1'b0;     // gated core enable
+  // Same advance condition as the core's Frame_Counter (enb & enable).
+  wire core_advance = s_txData_axis_tready & run_frame;
+
+  // ILA: mirror counters give the RE/symbol position so a capture can be lined
+  // up with which subcarrier/symbol each consumed payload byte belongs to.
+  (* mark_debug = "true" *) reg [8:0] re_mirror  = '0;   // mirrors subcarrier_counter (0..319)
+  (* mark_debug = "true" *) reg [7:0] sym_mirror = '0;   // mirrors ofdm_symbol_counter (0..239)
+  wire last_re_of_frame = (re_mirror == RE_PER_SYM-1) &&
+                          (sym_mirror == SYM_PER_FRAME-1);
+
+  always @(posedge axis_data_clk) begin
+    if (axis_data_rst_locked) begin
+      re_mirror  <= '0;
+      sym_mirror <= '0;
+    end else if (core_advance) begin
+      if (re_mirror == RE_PER_SYM-1) begin
+        re_mirror  <= '0;
+        sym_mirror <= (sym_mirror == SYM_PER_FRAME-1) ? '0 : sym_mirror + 1'b1;
+      end else begin
+        re_mirror <= re_mirror + 1'b1;
+      end
+    end
+  end
+
+  always @(posedge axis_data_clk) begin
+    if (axis_data_rst_locked) begin
+      run_frame <= 1'b0;
+    end else if (!enable_axis_clk) begin
+      run_frame <= 1'b0;                       // host disabled: pause
+    end else if (!run_frame) begin
+      run_frame <= frame_buffered;             // start a frame once one is queued
+    end else if (core_advance && last_re_of_frame) begin
+      run_frame <= frame_buffered;             // continue only if the next is queued
+    end
+  end
+
+  // The OFDM_Transmitter core has no output-ready (txData backpressure) port: it
+  // free-runs and asserts txValid whenever it has a sample. Its only stall input
+  // is clk_enable. The core now runs in the ce_250 domain (250 MHz, generated by
+  // the MMCM above) so its nominal sample rate matches the downstream radio's
+  // 250 MHz. Even so, the core's output is bursty (gaps for CP insertion / frame
+  // structure), so AXI-Stream backpressure is still required: gating clk_enable
+  // with s_txData_axis_tready freezes the whole core (output and payload
+  // consumption) whenever the output FIFO is full. No combinational loop:
+  // s_txData_axis_tready comes from the registered FIFO fullness, not from
+  // txValid. 'enable' is the frame-gated run_frame (see above).
   OFDM_Transmitter ofdm_transmitter_i (
     .clk            (axis_data_clk),
-    .reset          (axis_data_rst),
-    .clk_enable     (1'b1),
-    .enable         (enable_axis_clk),
+    .reset          (axis_data_rst_locked),
+    .clk_enable     (s_txData_axis_tready),
+    .enable         (run_frame),
     .txPayload_0    (m_txPayload_axis_tdata[0]),
     .txPayload_1    (m_txPayload_axis_tdata[1]),
-    .txPayloadValid (m_txPayload_axis_tvalid),
+    // Gate the payload-push with the AXI-Stream handshake. The OFDM core's
+    // internal FWFT FIFO pushes on txPayloadValid alone and only honors
+    // backpressure via txPayloadReady on its output. Without this gating the
+    // FIFO keeps accepting the upstream-held word every cycle while tready is
+    // low, pinning its occupancy at the full threshold so txPayloadReady never
+    // re-asserts. ANDing valid with ready makes a sample push only when the
+    // FIFO has room (proper AXI-Stream flow control).
+    .txPayloadValid (m_txPayload_axis_tvalid & m_txPayload_axis_tready),
     .ce_out         (),
     .txData_re      (s_txData_axis_tdata[31:16]),
     .txData_im      (s_txData_axis_tdata[15:0]),
@@ -292,13 +485,64 @@ module rfnoc_block_ofdm_tx_sl #(
     .txPayloadReady (m_txPayload_axis_tready)
   );
 
+  // Packetize the OFDM output stream. The output framer (axis_data_to_chdr,
+  // SIDEBAND_AT_END) frames a CHDR packet for every input packet, delimited by
+  // s_axis_tlast. Since the OFDM transmitter does not emit a packet boundary,
+  // count valid output samples and assert tlast every OUT_SPP samples so the
+  // framer produces fixed-size CHDR packets.
+  //
+  // OUT_SPP must stay within the MTU (2**MTU CHDR words; with CHDR_W=64 and a
+  // 32-bit item that is 2**MTU * 2 items, i.e. 2048 for MTU=10). Larger packets
+  // mean less per-packet header/handshake overhead, so the downstream radio --
+  // which consumes a sample every cycle at its fixed rate -- is far less likely
+  // to see inter-packet delivery gaps and underflow. 64 samples/packet is tiny
+  // (one CHDR header per 64 samples); 1024 cuts that overhead 16x.
+  localparam int OUT_SPP = 1024;
+
+  reg [$clog2(OUT_SPP)-1:0] out_samp_cnt = '0;
+  always @(posedge axis_data_clk) begin
+    if (axis_data_rst_locked) begin
+      out_samp_cnt <= '0;
+    end else if (s_txData_axis_tvalid && s_txData_axis_tready) begin
+      out_samp_cnt <= (out_samp_cnt == OUT_SPP-1) ? '0 : out_samp_cnt + 1'b1;
+    end
+  end
+
   assign s_txData_axis_tkeep      = 1'b1;
-  assign s_txData_axis_tlast      = 1'b0;
+  assign s_txData_axis_tlast      = (out_samp_cnt == OUT_SPP-1);
   assign s_txData_axis_ttimestamp = 64'b0;
   assign s_txData_axis_thas_time  = 1'b0;
   assign s_txData_axis_tlength    = 16'b0;
   assign s_txData_axis_teov       = 1'b0;
   assign s_txData_axis_teob       = 1'b0;
+
+  //---------------------------------------------------------------------------
+  // ILA debug core (ce_250 / axis_data_clk domain)
+  //---------------------------------------------------------------------------
+  // Localizes the data-dependent payload corruption. A constant/periodic payload
+  // comes through correct on hardware, but an arbitrary (golden) payload yields
+  // random, non-deterministic data subcarriers -- so the payload bits the core
+  // consumes diverge from what was fed. Capture those bits in-situ:
+  //   probe0 = payload bits, probe1/2 = tvalid/tready (a byte is consumed when
+  //   both are high). probe3..5 = core output + backpressure (clk_enable =
+  //   s_txData_axis_tready). probe6 = run_frame (gated enable). probe7/8 =
+  //   RE/symbol position, so each consumed byte maps to its subcarrier/symbol.
+  // Trigger on run_frame rising (frame start); the consumed-byte sequence
+  // (probe0 sampled when probe1 && probe2) should equal the fed payload byte
+  // stream -- if it jitters, the bug is in payload consumption/CDC; if it is
+  // correct but the output is wrong, the bug is in the core/IFFT.
+  ila_0 u_ila_txpayload (
+    .clk    (axis_data_clk),
+    .probe0 (m_txPayload_axis_tdata[1:0]),
+    .probe1 (m_txPayload_axis_tvalid),
+    .probe2 (m_txPayload_axis_tready),
+    .probe3 (s_txData_axis_tdata),
+    .probe4 (s_txData_axis_tvalid),
+    .probe5 (s_txData_axis_tready),
+    .probe6 (run_frame),
+    .probe7 (re_mirror),
+    .probe8 (sym_mirror)
+  );
 
 endmodule // rfnoc_block_ofdm_tx_sl
 
