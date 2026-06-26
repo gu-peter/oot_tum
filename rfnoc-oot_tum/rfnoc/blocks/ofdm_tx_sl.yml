@@ -61,13 +61,18 @@ data:
   # the data path is rate-matched to the downstream radio.
   clk_domain: ce_250
   inputs:
-    # txPayload: 2 QPSK payload bits per clock cycle, packed as bit0/bit1 of a uint8
+    # txPayload: 16 QPSK dibits packed per 32-bit item (dibit p in bits
+    # [2*p +: 2]). A real 32-bit item fully uses the CHDR payload bandwidth
+    # (16/16 dibits per word vs 2-of-8 bits with the old s8 byte interface) and
+    # round-trips intact through UHD's item32 converter, avoiding the s8
+    # sub-byte XOR-5 scramble. The wrapper's axis_dibit_unpack expands each word
+    # into the core's 1-dibit-per-cycle stream.
     txPayload:
-      item_width: 8
+      item_width: 32
       nipc: 1
       info_fifo_depth: 32
       payload_fifo_depth: 32
-      format: s8
+      format: sc16
   outputs:
     # txData: modulated I/Q samples
     txData:

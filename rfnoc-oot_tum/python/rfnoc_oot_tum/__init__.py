@@ -12,3 +12,4 @@ from . import rfnoc_oot_tum_python as lib
 
 # In UHD, we use CamelCase for names in Python, so we'll do the same here
 OfdmTxSlBlockControl = lib.ofdm_tx_sl_block_control
+OfdmRxSlBlockControl = lib.ofdm_rx_sl_block_control

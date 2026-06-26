@@ -1,0 +1,163 @@
+#
+# Copyright 2026 Ettus Research, a National Instruments Brand
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
+#
+
+##################################################
+# RFNoC Block Sources
+##################################################
+# Here, list all the files that are necessary to synthesize this block. Don't
+# include testbenches!
+# Make sure that the source files are nicely detectable by a regex. Best to put
+# one on each line.
+# The first argument to addprefix is the current path to this Makefile, so the
+# path list is always absolute, regardless of from where we're including or
+# calling this file. RFNOC_OOT_SRCS needs to be a simply expanded variable
+# (not a recursively expanded variable), and we take care of that in the build
+# infrastructure.
+RFNOC_BLOCK_OFDM_RX_SL_SRCS := $(addprefix $(dir $(abspath $(lastword $(MAKEFILE_LIST)))), \
+rfnoc_block_ofdm_rx_sl.sv \
+axis_dibit_pack.sv \
+noc_shell_ofdm_rx_sl.sv \
+OFDM_Receiver_pkg.sv \
+OFDM_Receiver.sv \
+applyLowerLimit.sv \
+Bank_A.sv \
+Bank_B.sv \
+Channel_Equalization.sv \
+Channel_Estimation_and_Equalization.sv \
+channelEstimationControl.sv \
+Channel_Estimation.sv \
+Channel_Estimator.sv \
+Complex4Multiply_block1.sv \
+Complex4Multiply_block.sv \
+Complex4Multiply.sv \
+Control.sv \
+CordicKernelMag.sv \
+Correlator.sv \
+CP_Correlation_to_Frequency.sv \
+CPRemoval_stage1.sv \
+CPRemoval_stage2.sv \
+Cyclic_Prefix_Correlation.sv \
+Data_Stream_Synchronizer.sv \
+dataSync_block1.sv \
+dataSync_block2.sv \
+dataSync_block.sv \
+dataSync.sv \
+Delay_Balance_block.sv \
+Delay_Balance.sv \
+Delay_Enabled_Synchronous1_block.sv \
+Delay_Enabled_Synchronous1.sv \
+Delay_Enabled_Synchronous2.sv \
+Delay_Enabled_Synchronous_block.sv \
+Delay_Enabled_Synchronous.sv \
+Discrete_FIR_Filter.sv \
+DitherGen.sv \
+DownSampler.sv \
+dsphdl_FFT.sv \
+FIFO.sv \
+FilterCoef_block1.sv \
+FilterCoef_block.sv \
+FilterCoef.sv \
+Filter.sv \
+FilterTapSystolicWvldin.sv \
+Frame_Counter.sv \
+Frequency_Correction.sv \
+Frequency_Offset.sv \
+Frequency_Stream_Synchronizer.sv \
+FWFT_FIFO.sv \
+fwft_logic.sv \
+Gold_Sequence_Generator.sv \
+Grid_Structure.sv \
+HDL_CMA_core.sv \
+HDLFFTShift.sv \
+Input_Scaling.sv \
+Interpolation_Control.sv \
+LFSR1.sv \
+LFSR2.sv \
+LookUpTableGen.sv \
+LS_Symbol.sv \
+Magnitude_Squared.sv \
+Magnitude_Squared_Thresh.sv \
+MATLAB_Function.sv \
+MovingAverage.sv \
+NCO_HDL_Optimized.sv \
+ofdmDemodControl.sv \
+OFDM_Demod_Scaling.sv \
+OFDM_Demodulation.sv \
+OFDM_Demodulator.sv \
+Peak_Diagnostics.sv \
+Product2.sv \
+Product3.sv \
+QPSK_Demodulation.sv \
+QPSK_Modulator.sv \
+Quadrant_Correction.sv \
+Quadrant_Mapper.sv \
+RADIX22FFT_CTRL1_1.sv \
+RADIX22FFT_CTRL1_2.sv \
+RADIX22FFT_CTRL1_3.sv \
+RADIX22FFT_CTRL1_4.sv \
+RADIX22FFT_CTRL1_5.sv \
+RADIX22FFT_CTRL1_6.sv \
+RADIX22FFT_CTRL1_7.sv \
+RADIX22FFT_CTRL1_8.sv \
+RADIX22FFT_SDF1_1.sv \
+RADIX22FFT_SDF1_3.sv \
+RADIX22FFT_SDF1_5.sv \
+RADIX22FFT_SDF1_7.sv \
+RADIX22FFT_SDF2_2.sv \
+RADIX22FFT_SDF2_4.sv \
+RADIX22FFT_SDF2_6.sv \
+RADIX22FFT_SDF2_8.sv \
+RADIX2FFT_bitNatural.sv \
+Reference_Generation.sv \
+Reference_Symbols.sv \
+Resource_Element_Type.sv \
+SamplesRepetition.sv \
+SDFCommutator1.sv \
+SDFCommutator2.sv \
+SDFCommutator3.sv \
+SDFCommutator4.sv \
+SDFCommutator5.sv \
+SDFCommutator6.sv \
+SDFCommutator7.sv \
+SDFCommutator8.sv \
+searchCtrl.sv \
+SetFF.sv \
+shiftMasksConst.sv \
+shiftMasks.sv \
+SimpleDualPortRAM_generic_block.sv \
+SimpleDualPortRAM_generic.sv \
+Sliding_Sum.sv \
+sr_latch1.sv \
+sr_latch2.sv \
+sr_latch.sv \
+Stream_Synchronizer.sv \
+strobeCounter.sv \
+SubcarrierSelector.sv \
+subFilter.sv \
+Synchronization.sv \
+Synchronize.sv \
+Synchronous_Delay_block1.sv \
+Synchronous_Delay_block2.sv \
+Synchronous_Delay_block3.sv \
+Synchronous_Delay_block.sv \
+Synchronous_Delay.sv \
+Synchronous_Enabled_Delay.sv \
+Thresholded_Correlator.sv \
+Threshold_Prescaling.sv \
+Threshold.sv \
+Time_Interpolation_RAMs.sv \
+Time_Interpolation.sv \
+Timing_Control.sv \
+Timing_Offset.sv \
+Timing_Track.sv \
+TWDLROM_3_1.sv \
+TWDLROM_5_1.sv \
+TWDLROM_7_1.sv \
+Two_Data_Stream_Synchronizer.sv \
+WaveformGen.sv \
+Windowed_Peak_Finder.sv \
+Window_Max.sv \
+)

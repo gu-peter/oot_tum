@@ -26,6 +26,7 @@ void* init_numpy()
     return NULL;
 }
 #include "ofdm_tx_sl_block_control_python.hpp"
+#include "ofdm_rx_sl_block_control_python.hpp"
 
 PYBIND11_MODULE(rfnoc_oot_tum_python, m)
 {
@@ -35,4 +36,5 @@ PYBIND11_MODULE(rfnoc_oot_tum_python, m)
 
     // uhd::rfnoc::python::export_noc_block_base(m);
         export_ofdm_tx_sl_block_control(m);
+    export_ofdm_rx_sl_block_control(m);
 }

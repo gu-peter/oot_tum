@@ -28,23 +28,28 @@ the DUC/DDC ratio is 1 and sc16 words pass through the loopback bit-for-bit).
 
 Two hardware realities shape the capture:
 
-  * Duty cycle: the OFDM core emits valid samples only ~25% of the time, so a
-    250 Msps radio sink starves and fills the gaps with zeros. Because the
-    radio transmits the block's samples in order (just interleaved with
-    underflow zeros), removing the zero runs reconstructs the contiguous OFDM
-    stream.
-  * Overflow: at 250 Msps (1 GB/s of sc16) the host cannot capture indefinitely
-    while also feeding the TX. An overflow *drops* samples, which would corrupt
-    the in-order reconstruction -- so we capture continuously and stop at the
-    first overflow, keeping only the contiguous, drop-free prefix.
+  * Duty cycle: the OFDM core emits valid samples ~93% of the time; the radio
+    sink fills the small remaining gaps with underflow zeros. Because the radio
+    transmits the block's samples in order (just interleaved with those zeros),
+    removing the zero runs reconstructs the contiguous OFDM stream.
+  * Overflow: at 250 Msps (1 GB/s of sc16) a single continuous capture overflows
+    at ~50040 samples -- the RADIO RX FIFO depth on the FPGA. Samples cannot
+    leave the FPGA at 250 Msps sustained over this 1 GbE/10 GbE path, so the FIFO
+    (which sits upstream of the host socket buffer and num_recv_frames pool)
+    fills and overflows. Bigger host buffers do NOT move this point. An overflow
+    drops samples and corrupts the in-order reconstruction, so we capture and
+    stop at the first overflow, keeping the contiguous, drop-free prefix.
 
 We then reconstruct the valid samples from that clean window, align them to the
-golden frame by cross-correlation, and compare the overlapping stretch within
-+-TOL_LSB. Feeding the *same* golden payload periodically (period NUM_TX_SAMPS)
-makes the output periodic with period NUM_RX_SAMPS, so the captured window is a
-contiguous slice of the golden frame regardless of where it starts. The number
-of verified samples depends on how large a clean window the transport allows;
-raise RECV_BUFFERING to push the overflow point out toward a full frame.
+golden frame, and compare within +-TOL_LSB.
+
+FRAME SIZE vs TRANSPORT: one OFDM frame is now NUM_RX_SAMPS = 8960 samples
+(28 syms * 320), which is well UNDER the ~50040-sample one-shot transport ceiling,
+so a whole frame can be captured contiguously through the radio loopback on this
+network. (The former 240-symbol frame of 76800 exceeded that ceiling and could
+only be partially captured here, with full verification deferred to the on-chip
+ILA sweep in verify_full_frame.py; that sweep still works but is now a redundant
+cross-check since the whole frame fits in one transport capture.)
 
 Run with (UHD must be able to find the OOT block controller):
     export UHD_MODULE_PATH=.../librfnoc-oot-blocks.so
@@ -53,6 +58,7 @@ Run with (UHD must be able to find the OOT block controller):
 
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -67,13 +73,26 @@ except ImportError:  # scipy is optional; fall back to numpy below.
 
 
 # --- Configuration ---
-DEVICE_ARGS = "addr=10.157.161.243, master_clock_rate=250e6"
+# The continuous RX capture overflows at a fixed ~50000 samples INDEPENDENT of
+# rate (250 -> 50040, 125 -> 49680), which means it is a fixed flow-control /
+# transport-buffer window, not a sustained drain-rate limit. ~50000 samples is
+# about UHD's default num_recv_frames * recv_frame_size, so we enlarge the
+# transport buffer here in the DEVICE args (for X4xx these are transport params
+# negotiated at device init -- putting num_recv_frames in the stream args has no
+# effect). recv_frame_size is bounded by the 1500-byte path MTU. master_clock_rate
+# == RATE so the DUC/DDC ratio is 1 and the loopback stays bit-exact.
+DEVICE_ARGS = ("addr=10.157.161.243, master_clock_rate=250e6, "
+               "num_recv_frames=4096, recv_frame_size=1472, recv_buff_size=50000000")
 RATE = 250e6  # radio sample rate; == master_clock_rate so the DUC/DDC ratio is 1
 
-# Optional transport buffering appended to the RX stream args. Larger host
-# buffers push the overflow point out, so a bigger (ideally full-frame) clean
-# window can be captured. Leave empty to use UHD defaults; example:
-# "num_recv_frames=2048".
+# Optional transport buffering appended to the RX stream args. This does NOT
+# move the overflow point: the capture overflows at ~50040 samples, which is the
+# RADIO RX FIFO depth on the FPGA -- upstream of the host socket buffer and the
+# num_recv_frames pool. Verified: num_recv_frames=1024/4096 and socket rmem=50 MB
+# make no difference. The limit is how fast samples can leave the FPGA over the
+# 1 GbE/10 GbE path at 250 Msps, not how much the host can buffer. See
+# feed_enable_capture for the full why-we-can't-capture-a-whole-frame note. Leave
+# empty to use UHD defaults.
 RECV_BUFFERING = ""
 
 # Golden-reference vectors, generated by the MATLAB reference and shared with
@@ -82,9 +101,16 @@ RECV_BUFFERING = ""
 _HERE = os.path.dirname(os.path.abspath(__file__))
 INPUT_HEX = os.path.join(_HERE, "ofdm_tx_input.hex")        # one int8 payload sample/line ("%02X")
 EXPECTED_HEX = os.path.join(_HERE, "ofdm_tx_expected.hex")  # one sc16 word/line ("%08X" = {I[31:16],Q[15:0]})
+# Two-frame golden (runIntroOFDMML.m with numTxFrames=2): two DISTINCT frames,
+# windowed continuously across the boundary. Selected with `--frames 2`.
+INPUT_HEX_2F = os.path.join(_HERE, "ofdm_tx_input_2frame.hex")
+EXPECTED_HEX_2F = os.path.join(_HERE, "ofdm_tx_expected_2frame.hex")
 
-NUM_TX_SAMPS = 40812  # int8 payload samples that make up one input frame
-NUM_RX_SAMPS = 76800  # sc16 output samples in one OFDM frame (240 syms * 320)
+NUM_TX_SAMPS = 4560   # QPSK dibits (20 data syms * 228) that make up one frame
+NUM_RX_SAMPS = 8960   # sc16 output samples in one OFDM frame (28 syms * 320)
+DIBITS_PER_WORD = 16  # dibits packed per 32-bit txPayload item (16 * 2 = 32 bit)
+# 32-bit words sent per frame (padded up to a whole word; ceil(4560/16) = 285)
+WORDS_PER_FRAME = (NUM_TX_SAMPS + DIBITS_PER_WORD - 1) // DIBITS_PER_WORD
 
 # Tolerance matches the testbench: spec is +-0.001 in the normalized double
 # domain, i.e. 0.001 * 32768 ~= 32.77 LSB in Q1.15 -> 33.
@@ -93,7 +119,7 @@ TOL_LSB = 33
 # OFDM frame geometry (for plotting / sanity prints only).
 FFT_LEN = 256
 CP_LEN = 64
-N_SYMS = 240
+N_SYMS = 28
 SAMP_PER_SYM = FFT_LEN + CP_LEN  # 320
 
 # Length of captured prefix used to cross-correlate for frame alignment. Kept
@@ -105,10 +131,16 @@ CORR_LEN = 2048
 # comparison (must exceed CORR_LEN with room for a meaningful overlap).
 MIN_VALID = 4096
 
-# Target capture length. At ~25% duty this is ~4 frames' worth of radio samples
-# per golden frame; we stop early at the first overflow, so this is just an
-# upper bound on how much we try to read.
-CAPTURE_SAMPS = 4 * NUM_RX_SAMPS
+# Target capture length. This must be a BOUNDED, finite burst -- just over one
+# frame -- NOT a multi-frame "effectively continuous" stream. Continuous RX from
+# this radio overflows at a fixed ~50000 samples (the radio RX FIFO depth) no
+# matter the rate or host buffering, because the SEP->host egress can't sustain
+# the radio rate. A bounded num_done burst that STOPS, however, lets the host
+# drain the FIFO after production ends (this is exactly why the UHD FFT loopback
+# example never overflows). One frame is 76800 valid samples (~82500 radio cycles
+# at the ~93% duty) plus a few thousand leading zeros before the block's first
+# output; the margin covers both.
+CAPTURE_SAMPS = NUM_RX_SAMPS + 18000
 
 # Minimum run of consecutive exact-zero sc16 words treated as a radio-underflow
 # gap (and removed). The golden frame contains only isolated single-sample
@@ -152,21 +184,46 @@ def to_complex(words):
     return i.astype(np.float64) + 1j * q.astype(np.float64)
 
 
+def sc16_cpu_to_item32(words):
+    """Convert captured sc16 host-buffer words to wire/item32 layout (swap halves).
+
+    UHD's "sc16" CPU format is little-endian complex<int16_t> = {real=I in the low
+    16 bits, imag=Q in the high 16 bits}, while the wire item32 -- and our golden
+    vectors and the HDL testbench -- use {I[31:16], Q[15:0]} (see UHD
+    convert_common.hpp xx_to_item32_sc16 / item32_sc16_x1_to_xx). So recv() hands
+    us each sample with its two 16-bit halves swapped relative to the wire
+    convention. Swapping them back here puts captured data in the same {I high,
+    Q low} layout as load_expected_output(), so split_iq()/to_complex() decode I
+    and Q correctly with no I/Q swap. This is the exact RX mirror of the half-swap
+    pack_dibits_to_words() already applies on the TX path.
+
+    Equivalent to UHD's canonical sc16_to_complex128() in
+    examples/python/rfnoc_txrx_fft_block_loopback.py, which reads real(I) from the
+    low 16 bits and imag(Q) from the high 16 bits; we keep the integer Q1.15 wire
+    domain instead (golden vectors + TOL_LSB) rather than its float /32767 output.
+    """
+    w = np.asarray(words, dtype=np.uint32)
+    return (((w & 0x0000FFFF) << 16) | ((w >> 16) & 0x0000FFFF)).astype(np.uint32)
+
+
 def build_graph():
     """Create the graph and connect Host -> ofdm_tx -> radio (loopback) -> Host."""
     graph = uhd.rfnoc.RfnocGraph(DEVICE_ARGS)
 
-    # txPayload is an 8-bit-per-sample stream (only the two LSBs are used:
-    # bit0 -> txPayload_0, bit1 -> txPayload_1), so feed it as s8.
-    sa_tx = uhd.usrp.StreamArgs("s8", "s8")
+    # txPayload is now a 32-bit item: each word carries 16 QPSK dibits (dibit p
+    # in bits [2*p +: 2]); pack_dibits_to_words() builds these and the FPGA
+    # axis_dibit_unpack expands them. Sent as sc16, one uint32 word per sample
+    # (same uint32-per-sample convention as the sc16 RX path below).
+    sa_tx = uhd.usrp.StreamArgs("sc16", "sc16")
     sa_tx.args = f"spp={SPP_TX}"
     tx_streamer = graph.create_tx_streamer(1, sa_tx)
 
     # The block emits sc16; capture it as sc16 (delivered into a uint32 buffer).
     sa_rx = uhd.usrp.StreamArgs("sc16", "sc16")
-    sa_rx.args = f"spp={SPP_RX}"
+    rx_args = f"spp={SPP_RX}"
     if RECV_BUFFERING:
-        sa_rx.args += f",{RECV_BUFFERING}"
+        rx_args += f",{RECV_BUFFERING}"
+    sa_rx.args = rx_args
     rx_streamer = graph.create_rx_streamer(1, sa_rx)
 
     ofdm = OfdmTxSlBlockControl(graph.get_block("0/Ofdm_tx_sl#0"))
@@ -189,44 +246,106 @@ def build_graph():
     return graph, tx_streamer, rx_streamer, ofdm, radio
 
 
-def reorder_payload_for_wire(payload):
-    """Compensate for the s8 payload byte-lane scramble on the CHDR transport.
+def bits_to_dibit_frames(bits, pad_value=0):
+    """Turn an arbitrary message bit array into whole OFDM frames of QPSK dibits.
 
-    On-hardware ILA capture of m_txPayload (the byte stream into the OFDM core,
-    in the ce_250 domain) proved that, within every 64-bit CHDR word (8 s8
-    bytes), the byte the host places at position m is delivered to the core at
-    position m XOR 5. Decoded, that is a 16-bit byte-swap combined with a 32-bit
-    word-swap inside each 64-bit word -- a plain endianness mismatch in how the
-    narrow s8 items ride the otherwise sc16/32-bit-oriented transport.
+    This is the "I have N bits, transmit them" entry point: the caller does not
+    have to know the frame size. We map each pair of bits to one QPSK dibit
+    (bit0 -> txPayload_0, bit1 -> txPayload_1, i.e. dibit = b0 | b1<<1),
+    segment the dibits into frames of NUM_TX_SAMPS, and zero-pad (or pad with
+    `pad_value`) the final partial frame up to a whole frame.
 
-    XOR is involutive, so pre-permuting the host payload by the same XOR-5 makes
-    it arrive in linear order. With this applied, the block output matches the
-    MATLAB golden frame to +-1 LSB across *all* symbols (sync, reference, AND
-    data); without it only the payload-independent sync/reference symbols match.
-    The trailing partial word (len % 8 != 0) is left as-is.
+    Returns a flat uint8 dibit array whose length is a multiple of NUM_TX_SAMPS
+    (one or more frames). Feed it straight to pack_dibits_to_words(); the block
+    then emits one waveform frame per frame automatically (the frame-gating FSM
+    sequences them). The number of frames is len(result) // NUM_TX_SAMPS; the
+    caller is responsible for telling the receiver how many of the bits are real
+    vs frame padding (a fixed-size-OFDM fact, not something the block decides).
     """
-    p = np.asarray(payload).reshape(-1)
-    src = np.arange(len(p))
-    tgt = src ^ 5
-    tgt[tgt >= len(p)] = src[tgt >= len(p)]  # guard the trailing partial word
-    return p[tgt]
+    bits = np.asarray(bits, dtype=np.uint8).reshape(-1) & 1
+    if len(bits) % 2:                         # need an even count for QPSK pairs
+        bits = np.concatenate([bits, np.zeros(1, dtype=np.uint8)])
+    dibits = (bits[0::2] | (bits[1::2] << 1)).astype(np.uint8)
+    pad = (-len(dibits)) % NUM_TX_SAMPS       # fill out the last partial frame
+    if pad:
+        dibits = np.concatenate([dibits, np.full(pad, pad_value, dtype=np.uint8)])
+    return dibits
+
+
+def pack_dibits_to_words(payload):
+    """Pack a per-dibit payload (one QPSK dibit, 0..3, per element) into the
+    32-bit items the block now consumes (16 dibits/word, dibit p in bits
+    [2*p +: 2]).
+
+    The block's txPayload port is a 32-bit item (sc16). A real 32-bit item uses
+    the full CHDR payload bandwidth (16/16 dibits per word vs 2-of-8 bits with
+    the old s8 byte interface) instead of the s8 XOR-5 byte scramble. The
+    FPGA-side axis_dibit_unpack reads dibit p from item bits [2*p +: 2].
+
+    One subtlety remains, and it is well-defined (not a fragile constant): the
+    sc16 CPU->wire converter treats each 32-bit buffer element as a complex
+    sample {I=low int16, Q=high int16} and packs the wire item as (I<<16)|Q --
+    i.e. it SWAPS the two 16-bit halves of our word. Confirmed on hardware via
+    ILA (pl_dibit): without the swap the core sees each word's halves reversed
+    (a 100%-clean 16-bit half-swap). We therefore pre-swap the halves here so the
+    FPGA receives the intended word [dibit p at bit 2*p]. (The HDL testbench
+    feeds items directly via send_packets_items, bypassing this CPU conversion,
+    so it does not and must not apply the swap.)
+
+    Each frame is padded up to a whole number of words; the unpacker drops the
+    pad so exactly NUM_TX_SAMPS dibits reach the core per frame. Returns a
+    uint32 array (one element per 32-bit sc16 item), which the sc16 streamer
+    sends one word per sample (same uint32-per-sample convention used on RX).
+    """
+    d = (np.asarray(payload).reshape(-1) & 3).astype(np.uint32)
+    if len(d) % NUM_TX_SAMPS != 0:
+        raise ValueError(f"payload length {len(d)} not a multiple of one frame "
+                         f"({NUM_TX_SAMPS})")
+    words = []
+    for f in range(len(d) // NUM_TX_SAMPS):
+        frame = d[f * NUM_TX_SAMPS:(f + 1) * NUM_TX_SAMPS]
+        pad = (-len(frame)) % DIBITS_PER_WORD
+        frame = np.concatenate([frame, np.zeros(pad, dtype=np.uint32)])
+        cols = frame.reshape(-1, DIBITS_PER_WORD)
+        w = np.zeros(cols.shape[0], dtype=np.uint32)
+        for p in range(DIBITS_PER_WORD):
+            w |= (cols[:, p] & 3) << (2 * p)
+        words.append(w)
+    out = np.concatenate(words).astype(np.uint32)
+    # Pre-swap 16-bit halves to cancel the sc16 (I<<16)|Q packing (see above).
+    return ((out & 0x0000FFFF) << 16) | ((out >> 16) & 0x0000FFFF)
 
 
 def feed_enable_capture(tx_streamer, rx_streamer, ofdm, radio, payload):
-    """Mirror the testbench single-shot sequence exactly.
+    """Feed one OR several consecutive frames and capture the block output.
 
-    The block is free-running, so its continuous output only reproduces the
-    golden frame if the payload is fed in lockstep with the framing. Rather than
-    rely on that, we replicate the testbench precisely: disable, feed *exactly
-    one* golden payload frame (no continuous feeding), then enable and capture
-    from the clean start. The block thus emits exactly the golden output frame,
-    so the captured window is golden sample 0 onward -- no payload-phase
+    The block is free-running, so its output only reproduces the golden
+    waveform(s) if the payload is fed in lockstep with the framing. We mirror the
+    testbench: disable, buffer the FIRST frame (the input FIFO holds ~one frame
+    and drives txPayloadReady low), then enable and capture from the clean start
+    -- so the captured window is golden sample 0 onward, no payload-phase
     ambiguity.
+
+    For a multi-frame payload (len(payload) == n_frames * NUM_TX_SAMPS) the
+    remaining frames cannot be pre-buffered (only one frame fits), so they are
+    streamed in AFTER enable, in the same burst: the block drains frame 1 while
+    frame 2 arrives, so run_frame stays continuous and the frames come out
+    back-to-back (the windowing overlap-adds across the boundary exactly as the
+    continuous MATLAB golden does -- verified in the HDL TB). Two 28-symbol
+    frames are 2*8960 = 17920 samples, still under the ~50040 radio-RX-FIFO
+    one-shot ceiling, so both fit in a single bounded num_done capture.
 
     Capture starts immediately (stream_now) and stops at the first overflow,
     returning the contiguous, drop-free prefix as a uint32 array.
     """
-    data_in = reorder_payload_for_wire(payload).reshape(1, -1).astype(np.int8)
+    # Pack the per-dibit payload into 32-bit words and send as sc16 (one uint32
+    # word per sample). WORDS_PER_FRAME words carry one frame's NUM_TX_SAMPS
+    # dibits (padded to a word boundary; the FPGA unpacker drops the pad).
+    data_in = pack_dibits_to_words(payload).reshape(1, -1).astype(np.uint32)
+    n_frames = max(1, len(payload) // NUM_TX_SAMPS)
+    # Capture window scales with the number of frames (plus leading-zero / duty
+    # margin); must stay under the ~50040 one-shot RX-FIFO ceiling.
+    cap_samps = n_frames * NUM_RX_SAMPS + 18000
 
     # Start disabled so the input FIFO can fill without being drained (pops
     # require enable), exactly as the TB does.
@@ -234,18 +353,48 @@ def feed_enable_capture(tx_streamer, rx_streamer, ofdm, radio, payload):
     radio.poke32(0x1000, 1)  # digital loopback ON for the capture
     print(f"Loopback register readback: {radio.peek32(0x1000)} (expected 1)")
 
-    # Feed exactly one golden frame as a single closed burst. With the block
-    # disabled the input FIFO fills and holds it (the TB confirms one frame fits
-    # and drives txPayloadReady low).
+    # Feed the payload as ONE continuous burst (SOB+EOB on the whole thing) --
+    # the hardware equivalent of the TB's single send_packets_items. For a single
+    # frame this is one blocking send that fits in the FIFO. For multiple frames
+    # only the first frame fits while disabled, so send() blocks after frame 1
+    # until enable drains it; we therefore run it in a thread and enable below,
+    # which lets the SAME burst stream frame 2.. in contiguously at hardware speed
+    # (a split into two send()s does NOT work -- the second never re-arms the
+    # frame gating, observed as only frame 1 emitting).
     tx_md = uhd.types.TXMetadata()
     tx_md.has_time_spec = False
     tx_md.start_of_burst = True
     tx_md.end_of_burst = True
-    n_fed = tx_streamer.send(data_in, tx_md, timeout=5.0)
-    print(f"Fed {n_fed}/{len(payload)} payload samples (single frame)")
-    if n_fed < len(payload):
-        print("WARNING: could not feed a whole frame before the FIFO filled; "
-              "the input FIFO is smaller than one frame on this build")
+    feeder_thread = None
+    if n_frames == 1:
+        n_fed = tx_streamer.send(data_in, tx_md, timeout=5.0)
+        print(f"Fed {n_fed}/{data_in.shape[-1]} words "
+              f"({len(payload)} dibits, single frame)")
+        if n_fed < data_in.shape[-1]:
+            print("WARNING: could not feed a whole frame before the FIFO filled; "
+                  "the input FIFO is smaller than one frame on this build")
+    else:
+        def _feed_all():
+            # Send the payload one frame at a time (the "send one frame, then the
+            # next" model). The wrapper's run_frame FSM keeps the core running as
+            # long as the FIFO holds the next full frame (it re-checks
+            # frame_buffered at every frame boundary), so frames emit back-to-back
+            # with NO per-frame re-enable. SOB marks only the first send and EOB
+            # only the last, so the N sends look like one continuous burst. Each
+            # send() blocks until the FIFO has room, which naturally paces the
+            # feed to the core's drain rate.
+            for i in range(n_frames):
+                md = uhd.types.TXMetadata()
+                md.has_time_spec = False
+                md.start_of_burst = (i == 0)
+                md.end_of_burst = (i == n_frames - 1)
+                frame_words = data_in[:, i * WORDS_PER_FRAME:(i + 1) * WORDS_PER_FRAME]
+                tx_streamer.send(frame_words, md, timeout=10.0)
+        feeder_thread = threading.Thread(target=_feed_all, daemon=True)
+        feeder_thread.start()
+        print(f"Feeding {n_frames} frames ({WORDS_PER_FRAME} words each) one at a "
+              "time from a thread; frame 1 buffers while disabled, each subsequent "
+              "frame is pushed as the FIFO drains so run_frame stays continuous")
 
     # Wait for the FIFO to report full (txPayloadReady low), like the TB's
     # "enabler" process.
@@ -259,37 +408,59 @@ def feed_enable_capture(tx_streamer, rx_streamer, ofdm, radio, payload):
     print("Input FIFO full (txPayloadReady low)"
           if filled else "FIFO did not report full within 5 s; proceeding anyway")
 
-    # Start capturing immediately, THEN enable, so we catch the frame from its
-    # first output sample (it lasts only ~1.2 ms, far sooner than a timed
-    # capture would fire). Leading samples before enable are zeros and get
-    # stripped as a gap during reconstruction.
+    # Capture exactly like rfnoc_txrx_fft_block_loopback.py: a single bounded,
+    # time-aligned num_done command drained into ONE full-size buffer -- not an
+    # open-ended stream_now capture read in tiny chunks. The old approach issued
+    # stream_now=True for CAPTURE_SAMPS and read it in SPP_RX (8192) chunks in a
+    # Python loop; the per-recv Python overhead meant the host could not sustain
+    # 250 Msps, so the radio RX FIFO overflowed at ~50040 samples. The FFT
+    # example never overflows even at 400 Msps because it bounds the volume and
+    # pulls it in one big recv (UHD drains packets internally, no per-iteration
+    # overhead). We do the same here: schedule the receive a fixed time ahead,
+    # enable the block so its frame lands inside the window, and recv the whole
+    # remaining buffer per call (typically one or two calls).
+    rx_md = uhd.types.RXMetadata()
+    raw_out = np.zeros((1, cap_samps), dtype=np.uint32)
+
+    # Start the receive immediately, THEN enable the block, so we catch the frame
+    # from its first output sample: the block emits its buffered frame the
+    # instant it is enabled (each frame lasts only ~36 us), so a timed/future
+    # receive window would miss it entirely. Leading zeros before the first output
+    # sample are stripped as a gap during reconstruction.
     stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.num_done)
     stream_cmd.stream_now = True
-    stream_cmd.num_samps = CAPTURE_SAMPS
+    stream_cmd.num_samps = cap_samps
     rx_streamer.issue_stream_cmd(stream_cmd)
     ofdm.set_enable(True)
     print(f"enable readback: {int(ofdm.get_enable())} (expected 1)")
+    # For multi-frame, enabling here unblocks the feeder thread's in-flight burst:
+    # as frame 1 drains, frames 2.. stream in contiguously (same burst) and emit
+    # back-to-back. Their output buffers in the radio RX FIFO and is drained below.
 
-    rx_md = uhd.types.RXMetadata()
-    raw_out = np.zeros(CAPTURE_SAMPS, dtype=np.uint32)
-    chunk = np.zeros((1, SPP_RX), dtype=np.uint32)
     got = 0
-    while got < CAPTURE_SAMPS:
-        n = rx_streamer.recv(chunk, rx_md, timeout=10.0)
+    overflowed = False
+    while got < cap_samps:
+        # Pass the entire remaining buffer each call (one row -> contiguous) so
+        # UHD fills it in as few calls as possible instead of 8192 at a time.
+        n = rx_streamer.recv(raw_out[:, got:], rx_md, timeout=5.0)
         err = str(rx_md.error_code).lower()
         if "overflow" in err:
             # Samples were dropped; everything after this point is no longer
             # contiguous, so stop and keep the clean prefix.
+            overflowed = True
             print(f"Overflow after {got} samples; keeping the clean prefix")
+            break
+        if "timeout" in err:
+            print(f"recv timeout after {got} samples")
             break
         if n == 0:
             print(f"recv=0  error={rx_md.error_code}")
             break
         if "none" not in err:
             print(f"  RX error: {rx_md.error_code}")
-        copy = min(n, CAPTURE_SAMPS - got)
-        raw_out[got:got + copy] = chunk[0, :copy]
-        got += copy
+        got += n
+    if not overflowed and got >= cap_samps:
+        print("No overflow: captured the full bounded window")
 
     # Stop the radio streaming (UHD names this enum value "stop_cont"; fall back
     # to "stop_continuous" on older bindings).
@@ -297,11 +468,15 @@ def feed_enable_capture(tx_streamer, rx_streamer, ofdm, radio, payload):
                         getattr(uhd.types.StreamMode, "stop_continuous", None))
     if stop_mode is not None:
         rx_streamer.issue_stream_cmd(uhd.types.StreamCMD(stop_mode))
-    print(f"Captured {got}/{CAPTURE_SAMPS} sc16")
+    print(f"Captured {got}/{cap_samps} sc16")
 
     ofdm.set_enable(False)
     radio.poke32(0x1000, 0)
-    return raw_out[:got]
+    if feeder_thread is not None:
+        feeder_thread.join(timeout=2.0)
+    # Normalize sc16 host-buffer layout -> wire/item32 layout so I and Q decode
+    # without an I/Q swap downstream (mirror of the TX pre-swap).
+    return sc16_cpu_to_item32(raw_out[0, :got])
 
 
 def reconstruct_valid(captured):
@@ -349,10 +524,15 @@ def align_by_magnitude(valid, expected):
         n = len(tiled_mag) - len(tmpl_mag) + 1
         corr = np.array([np.dot(tiled_mag[k:k + len(tmpl_mag)], tmpl_mag)
                          for k in range(n)])
-    region = np.abs(corr[:NUM_RX_SAMPS])
+    # Search the offset over one full golden period (len(expected)) and verify as
+    # many contiguous samples as we have, up to the whole golden -- so a multi-
+    # frame golden (e.g. 2 frames = 17920) is checked end to end, not just the
+    # first frame. For a single-frame golden len(expected) == NUM_RX_SAMPS, so
+    # this is identical to the original one-frame behavior.
+    region = np.abs(corr[:len(expected)])
     offset = int(np.argmax(region))
     lock_ratio = float(region[offset] / (np.median(region) + 1e-9))
-    overlap_len = min(len(valid), NUM_RX_SAMPS)
+    overlap_len = min(len(valid), len(expected))
     return offset, overlap_len, lock_ratio
 
 
@@ -362,15 +542,14 @@ def analyze(valid, offset, overlap_len, expected):
     The loopback here is digital (DUC/DDC ratio 1), so the captured samples
     should equal the golden output bit-for-bit -- no amplitude/phase calibration
     is warranted. We therefore compare the captured samples *raw* (no gain
-    correction) against the golden reference, trying the samples as-is and with
-    I and Q swapped (the host sc16 word order is the opposite of the testbench's
-    {I[31:16], Q[15:0]}). Returns a dict describing the best (lowest-EVM)
-    variant, including the I/Q deviation against the +-TOL_LSB testbench
-    criterion.
+    correction) against the golden reference. Captured data is normalized to
+    wire/item32 layout at the recv boundary (sc16_cpu_to_item32), so I and Q line
+    up directly with the golden vectors -- no I/Q-swap variant needed. Returns a
+    dict describing the result, including the I/Q deviation against the +-TOL_LSB
+    testbench criterion.
     """
     got = to_complex(valid[:overlap_len])
     exp = to_complex(np.tile(expected, 2)[offset:offset + overlap_len])
-    got_swap = 1j * np.conj(got)  # swap I<->Q: (i + jq) -> (q + ji)
 
     # Magnitude-only fit: invariant to any rotation / I-Q swap / frequency
     # offset. Low magnitude-EVM with high complex-EVM means the block produces
@@ -401,27 +580,42 @@ def analyze(valid, offset, overlap_len, expected):
     if np.any(amask):
         print(f"  best single magnitude scale: captured ~= {scale:.4f} * expected")
 
-    best = None
-    for name, gz in (("direct", got), ("iq-swap", got_swap)):
-        # Raw comparison: no gain/phase correction. EVM is the residual against
-        # the golden reference over the strong samples (~0 means bit-exact).
-        if np.any(amask):
-            evm = float(np.linalg.norm((gz - exp)[amask])
-                        / (np.linalg.norm(exp[amask]) + 1e-9))
-        else:
-            evm = float("inf")
-        dev_i = np.abs(np.real(gz) - np.real(exp))
-        dev_q = np.abs(np.imag(gz) - np.imag(exp))
-        max_dev = float(max(dev_i.max(), dev_q.max()))
-        n_fail = int(np.count_nonzero((dev_i > TOL_LSB) | (dev_q > TOL_LSB)))
-        info = dict(name=name, evm=evm, max_dev=max_dev, n_fail=n_fail,
-                    mag_evm=mag_evm, corrected=gz, exp=exp,
-                    dev_i=dev_i, dev_q=dev_q)
-        print(f"  [{name:8s}] EVM={evm * 100:6.2f}%  "
-              f"max_dev={max_dev:.0f} LSB  n_fail={n_fail}")
-        if best is None or evm < best["evm"]:
-            best = info
+    # Raw comparison: no gain/phase correction. EVM is the residual against the
+    # golden reference over the strong samples (~0 means bit-exact).
+    if np.any(amask):
+        evm = float(np.linalg.norm((got - exp)[amask])
+                    / (np.linalg.norm(exp[amask]) + 1e-9))
+    else:
+        evm = float("inf")
+    dev_i = np.abs(np.real(got) - np.real(exp))
+    dev_q = np.abs(np.imag(got) - np.imag(exp))
+    max_dev = float(max(dev_i.max(), dev_q.max()))
+    n_fail = int(np.count_nonzero((dev_i > TOL_LSB) | (dev_q > TOL_LSB)))
+    best = dict(name="direct", evm=evm, max_dev=max_dev, n_fail=n_fail,
+                mag_evm=mag_evm, corrected=got, exp=exp,
+                dev_i=dev_i, dev_q=dev_q)
+    print(f"  [direct  ] EVM={evm * 100:6.2f}%  "
+          f"max_dev={max_dev:.0f} LSB  n_fail={n_fail}")
     return best
+
+
+def analyze_quiet(valid, offset, overlap_len, expected):
+    """Non-printing version of analyze() for the stitched loop.
+
+    Compares the captured stretch (aligned at `offset` in the tiled golden frame)
+    against the reference and returns its +-TOL_LSB deviation stats. Captured data
+    is normalized to wire/item32 layout at the recv boundary (sc16_cpu_to_item32),
+    so I and Q line up directly -- no I/Q-swap variant needed.
+    """
+    got = to_complex(valid[:overlap_len])
+    exp = to_complex(np.tile(expected, 2)[offset:offset + overlap_len])
+    dev_i = np.abs(np.real(got) - np.real(exp))
+    dev_q = np.abs(np.imag(got) - np.imag(exp))
+    evm = float(np.linalg.norm(got - exp) / (np.linalg.norm(exp) + 1e-9))
+    return dict(name="direct", evm=evm,
+                max_dev=float(max(dev_i.max(), dev_q.max())),
+                n_fail=int(np.count_nonzero((dev_i > TOL_LSB) | (dev_q > TOL_LSB))),
+                dev_i=dev_i, dev_q=dev_q)
 
 
 def plot_expected_output(expected):
@@ -503,16 +697,314 @@ def plot(best, overlap_len):
         pass
 
 
+def run_live(tx_streamer, rx_streamer, ofdm, radio, payload, expected, pause=0.05):
+    """Continuously feed one frame / capture one frame and live-update the plot.
+
+    Loops feed_enable_capture (one bounded num_done capture per pass), aligns the
+    capture to the golden frame, and refreshes a single matplotlib figure in
+    place (interactive mode) instead of opening a fresh blocking window each time.
+    The loop runs until the figure window is closed (or Ctrl-C). I/Q are shown in
+    sfix1,16,15 (Q1.15, 1.0 -> 32768); the bottom axis tracks the per-sample
+    |deviation| against the +-TOL_LSB testbench criterion, so a live PASS/FAIL is
+    visible as the trace staying under the tolerance line.
+    """
+    import matplotlib.pyplot as plt
+
+    plt.ion()
+    fig, axes = plt.subplots(3, 1, figsize=(14, 9))
+    (l_ei,) = axes[0].plot([], [], label="expected I")
+    (l_gi,) = axes[0].plot([], [], "--", label="captured I")
+    axes[0].set_ylabel("I"); axes[0].set_ylim(-1.05, 1.05)
+    axes[0].legend(loc="upper right"); axes[0].grid(True)
+
+    (l_eq,) = axes[1].plot([], [], label="expected Q")
+    (l_gq,) = axes[1].plot([], [], "--", label="captured Q")
+    axes[1].set_ylabel("Q"); axes[1].set_ylim(-1.05, 1.05)
+    axes[1].legend(loc="upper right"); axes[1].grid(True)
+
+    (l_di,) = axes[2].plot([], [], label="|dev I|")
+    (l_dq,) = axes[2].plot([], [], label="|dev Q|")
+    axes[2].axhline(TOL_LSB, color="r", ls=":", label=f"tol {TOL_LSB}")
+    axes[2].set_ylabel("LSB"); axes[2].set_xlabel("sample index")
+    axes[2].legend(loc="upper right"); axes[2].grid(True)
+    fig.tight_layout()
+    plt.show(block=False)
+
+    frame_i = 0
+    try:
+        while plt.fignum_exists(fig.number):
+            frame_i += 1
+            captured = feed_enable_capture(tx_streamer, rx_streamer, ofdm, radio,
+                                           payload)
+            valid = reconstruct_valid(captured)
+            if len(valid) < MIN_VALID:
+                axes[0].set_title(f"frame {frame_i}: only {len(valid)} valid "
+                                  "samples (block producing output?)")
+                fig.canvas.draw_idle(); plt.pause(max(pause, 0.1))
+                continue
+
+            offset, _, lock_ratio = align_by_magnitude(valid, expected)
+            # Compare ONLY the contiguous run from `offset` to the end of the
+            # single golden frame -- do NOT tile/wrap. A capture that aligns at
+            # offset != 0 would, if compared against the tiled golden, straddle
+            # the frame boundary; there the tiled single-frame golden ramps from
+            # zero while the real hardware stream overlap-adds the inter-frame
+            # raised-cosine window (windowLength=9). That seam produces ~8
+            # out-of-tolerance samples that are a golden-TILING artifact, not a
+            # block error (see the multi-frame note). Restricting the window to
+            # the non-wrapping region removes the false seam without masking any
+            # real sample.
+            overlap_len = min(len(valid), len(expected) - offset)
+
+            got = to_complex(valid[:overlap_len])
+            exp = to_complex(expected[offset:offset + overlap_len])
+            dev_i = np.abs(np.real(got) - np.real(exp))
+            dev_q = np.abs(np.imag(got) - np.imag(exp))
+            n_fail = int(np.count_nonzero((dev_i > TOL_LSB) | (dev_q > TOL_LSB)))
+            max_dev = float(max(dev_i.max(), dev_q.max())) if overlap_len else 0.0
+            evm = float(np.linalg.norm(got - exp) / (np.linalg.norm(exp) + 1e-9))
+
+            gi, gq = np.real(got) / 32768.0, np.imag(got) / 32768.0
+            ei, eq = np.real(exp) / 32768.0, np.imag(exp) / 32768.0
+            x = np.arange(overlap_len)
+
+            l_ei.set_data(x, ei); l_gi.set_data(x, gi)
+            l_eq.set_data(x, eq); l_gq.set_data(x, gq)
+            l_di.set_data(x, dev_i)
+            l_dq.set_data(x, dev_q)
+
+            for ax in axes:
+                ax.set_xlim(0, max(overlap_len, 1))
+            axes[2].relim(); axes[2].autoscale_view(scalex=False, scaley=True)
+
+            status = "PASS" if (n_fail == 0 and lock_ratio >= 3.0) else "FAIL"
+            axes[0].set_title(
+                f"frame {frame_i}  [{status}]  lock={lock_ratio:.1f}  off={offset}  "
+                f"EVM={evm * 100:.2f}%  max_dev={int(max_dev)} LSB  "
+                f"n_fail={n_fail}/{overlap_len}")
+            if n_fail:
+                fail = np.where((dev_i > TOL_LSB) | (dev_q > TOL_LSB))[0]
+                # Position of each failure within the golden frame / OFDM symbol,
+                # to tell a genuine error from any residual edge effect.
+                gidx = offset + fail
+                print(f"  fail golden-idx: {gidx[:16].tolist()}"
+                      f"{' ...' if len(gidx) > 16 else ''}; "
+                      f"within-symbol: {(gidx % SAMP_PER_SYM)[:16].tolist()}")
+            print(f"frame {frame_i}: {status} lock={lock_ratio:.1f} "
+                  f"max_dev={int(max_dev)} n_fail={n_fail}/{overlap_len}")
+            fig.canvas.draw_idle()
+            plt.pause(pause)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ofdm.set_enable(False)
+        radio.poke32(0x1000, 0)
+    print(f"Live loop stopped after {frame_i} frame(s)")
+
+
+def _capture_prefix(rx_streamer):
+    """Run one bounded num_done capture and return the contiguous, drop-free
+    prefix (uint32) up to the first overflow. Used by the stitched verifier; the
+    block must already be enabled and producing a continuous periodic stream."""
+    rx_md = uhd.types.RXMetadata()
+    raw_out = np.zeros((1, CAPTURE_SAMPS), dtype=np.uint32)
+    stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.num_done)
+    stream_cmd.stream_now = True
+    stream_cmd.num_samps = CAPTURE_SAMPS
+    rx_streamer.issue_stream_cmd(stream_cmd)
+    got = 0
+    while got < CAPTURE_SAMPS:
+        n = rx_streamer.recv(raw_out[:, got:], rx_md, timeout=5.0)
+        err = str(rx_md.error_code).lower()
+        if "overflow" in err:
+            break
+        if "timeout" in err or n == 0:
+            break
+        got += n
+    stop_mode = getattr(uhd.types.StreamMode, "stop_cont",
+                        getattr(uhd.types.StreamMode, "stop_continuous", None))
+    if stop_mode is not None:
+        rx_streamer.issue_stream_cmd(uhd.types.StreamCMD(stop_mode))
+    return sc16_cpu_to_item32(raw_out[0, :got])
+
+
+def _start_tx_feeder(tx_streamer, data_in, stop_evt):
+    """Continuously stream the golden frame so the block runs frame-after-frame.
+
+    The block's input FIFO holds only ~one frame, so to make the output periodic
+    (period NUM_RX_SAMPS) we must keep feeding while it consumes. We send whole
+    frames back-to-back in one open burst (SOB on the first send, no EOB until
+    stop); tx_streamer.send backpressures, so this self-paces to the block's
+    consumption rate. Runs in a daemon thread until stop_evt is set.
+    """
+    def loop():
+        md = uhd.types.TXMetadata()
+        md.has_time_spec = False
+        first = True
+        while not stop_evt.is_set():
+            md.start_of_burst = first
+            md.end_of_burst = False
+            try:
+                tx_streamer.send(data_in, md, timeout=1.0)
+            except Exception:
+                break
+            first = False
+        # Close the burst cleanly.
+        md.start_of_burst = False
+        md.end_of_burst = True
+        try:
+            tx_streamer.send(data_in[:, :0], md, timeout=1.0)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+    return t
+
+
+def verify_stitched(tx_streamer, rx_streamer, ofdm, radio, payload, expected,
+                    max_caps=24):
+    """Verify all 240 OFDM symbols over the radio loopback by stitching.
+
+    A single capture overflows at the radio RX FIFO ceiling (~50000 samples,
+    ~150 symbols) -- less than one 76800-sample frame -- so no single capture can
+    cover the whole frame. We instead feed golden frames CONTINUOUSLY so the
+    block emits a periodic stream (period NUM_RX_SAMPS), then take several bounded
+    captures. Because the frame counter free-runs between captures (each is many
+    frame periods apart), every capture lands at a different, effectively random
+    frame phase. align_by_magnitude (a robust, I/Q-swap-invariant envelope
+    correlation, lock ratio ~60 here) finds each capture's offset; we union the
+    covered symbols and apply the testbench +-TOL_LSB check until all N_SYMS
+    symbols are covered with zero out-of-tolerance samples.
+    """
+    data_in = pack_dibits_to_words(payload).reshape(1, -1).astype(np.uint32)
+
+    ofdm.set_enable(False)
+    radio.poke32(0x1000, 1)  # digital loopback ON
+    print(f"Loopback register readback: {radio.peek32(0x1000)} (expected 1)")
+
+    stop_evt = threading.Event()
+    feeder = _start_tx_feeder(tx_streamer, data_in, stop_evt)
+    time.sleep(0.1)            # let the input FIFO fill before enabling
+    ofdm.set_enable(True)
+    print(f"enable readback: {int(ofdm.get_enable())} (expected 1); "
+          "feeding frames continuously, capturing phased windows...")
+    time.sleep(0.05)           # let the periodic output get going
+
+    covered = np.zeros(N_SYMS, dtype=bool)
+    persym_dev = np.zeros(N_SYMS, dtype=np.int64)
+    total_fail = 0
+    total_chk = 0
+    worst = 0
+    variants = []
+    print(f"\n{'cap':>4} {'valid':>7} {'offset':>7} {'sym':>6} {'lock':>6} "
+          f"{'variant':>8} {'maxdev':>7} {'nfail':>7}  newly-covered")
+    try:
+        for cap_i in range(max_caps):
+            captured = _capture_prefix(rx_streamer)
+            valid = reconstruct_valid(captured)
+            if len(valid) < MIN_VALID:
+                print(f"{cap_i:>4} {len(valid):>7}   (too few valid samples, skipped)")
+                continue
+            offset, overlap_len, lock_ratio = align_by_magnitude(valid, expected)
+            if lock_ratio < 3.0:
+                print(f"{cap_i:>4} {len(valid):>7} {offset:>7} {'--':>6} "
+                      f"{lock_ratio:>6.1f}  (weak lock, skipped)")
+                continue
+            best = analyze_quiet(valid, offset, overlap_len, expected)
+            variants.append(best["name"])
+            total_fail += best["n_fail"]
+            total_chk += overlap_len
+            worst = max(worst, int(best["max_dev"]))
+
+            idx = (offset + np.arange(overlap_len)) % NUM_RX_SAMPS
+            syms = np.unique(idx // SAMP_PER_SYM)
+            newly = int(np.sum(~covered[syms]))
+            covered[syms] = True
+            # Track worst per-symbol deviation for the coverage map.
+            dev = np.maximum(best["dev_i"], best["dev_q"]).astype(np.int64)
+            np.maximum.at(persym_dev, idx // SAMP_PER_SYM, dev)
+
+            print(f"{cap_i:>4} {len(valid):>7} {offset:>7} "
+                  f"{offset / SAMP_PER_SYM:>6.0f} {lock_ratio:>6.1f} "
+                  f"{best['name']:>8} {int(best['max_dev']):>7} {best['n_fail']:>7}  "
+                  f"+{newly} -> {covered.sum()}/{N_SYMS}")
+            if covered.all():
+                print(f"\nAll {N_SYMS} symbols covered.")
+                break
+    finally:
+        ofdm.set_enable(False)
+        stop_evt.set()
+        feeder.join(timeout=2.0)
+        radio.poke32(0x1000, 0)
+
+    miss = np.where(~covered)[0]
+    return dict(covered=covered, miss=miss, total_fail=total_fail,
+                total_chk=total_chk, worst=worst, persym_dev=persym_dev,
+                variants=variants)
+
+
 def main():
-    """Feed the golden payload, capture the OFDM output, verify against golden."""
+    """Feed the golden payload, capture the OFDM output, verify against golden.
+
+    `--frames 2` feeds the two-frame golden (doubled TX bits) so the block emits
+    two consecutive waveforms; default is one frame.
+    """
+    n_frames = 1
+    if "--frames" in sys.argv:
+        n_frames = int(sys.argv[sys.argv.index("--frames") + 1])
+    elif "--frames=2" in sys.argv or "--two-frames" in sys.argv:
+        n_frames = 2
+
+    live = "--live" in sys.argv
+
     payload = load_input_payload(INPUT_HEX)
     expected = load_expected_output(EXPECTED_HEX)
-    print(f"Loaded {len(payload)} payload samples and {len(expected)} expected sc16 words")
-    if len(payload) != NUM_TX_SAMPS or len(expected) != NUM_RX_SAMPS:
+    if n_frames >= 2:
+        # Prefer a CONTINUOUS N-frame golden (runIntroOFDMML.m with
+        # numTxFrames=N). It is the only reference that models the OFDM
+        # inter-frame windowing: the modulator's raised-cosine window
+        # (windowLength=9) overlaps every symbol boundary, including each
+        # frame's first symbol with the previous frame's tail. A tiled
+        # single-frame golden has a ramp-from-zero at every frame start instead,
+        # so its first ~9 samples per frame are wrong -- exactly the boundary
+        # mismatch seen otherwise. Feed it frame-by-frame (the feeder slices by
+        # WORDS_PER_FRAME), distinct per-frame data and all.
+        in_n = os.path.join(_HERE, f"ofdm_tx_input_{n_frames}frame.hex")
+        exp_n = os.path.join(_HERE, f"ofdm_tx_expected_{n_frames}frame.hex")
+        if os.path.exists(in_n) and os.path.exists(exp_n):
+            payload = load_input_payload(in_n)
+            expected = load_expected_output(exp_n)
+            print(f"Using continuous {n_frames}-frame golden "
+                  f"({os.path.basename(in_n)}): distinct per-frame data, "
+                  "inter-frame windowing modeled")
+        else:
+            # No continuous golden on disk: tile the single-frame golden. The
+            # block still emits a correct continuous waveform, but the tiled
+            # reference cannot reproduce the inter-frame window, so the first ~9
+            # samples of each frame after the first will read as failures. Run
+            # runIntroOFDMML.m with numTxFrames=%d to get an exact reference.
+            print(f"NOTE: no ofdm_tx_input_{n_frames}frame.hex found; tiling the "
+                  "single-frame golden. The block emits a correct continuous "
+                  "waveform, but the tiled reference can't model the OFDM "
+                  "inter-frame window, so expect ~9 boundary samples per frame to "
+                  "report as out-of-tolerance. Generate a continuous golden "
+                  f"(runIntroOFDMML.m, numTxFrames={n_frames}) for an exact check.")
+            payload = np.tile(payload, n_frames)
+            expected = np.tile(expected, n_frames)
+    print(f"Loaded {len(payload)} payload samples and {len(expected)} expected sc16 words "
+          f"({n_frames} frame(s))")
+    if len(payload) != n_frames * NUM_TX_SAMPS or len(expected) != n_frames * NUM_RX_SAMPS:
         print(f"WARNING: vector sizes ({len(payload)}, {len(expected)}) differ from "
-              f"expected ({NUM_TX_SAMPS}, {NUM_RX_SAMPS})")
+              f"expected ({n_frames * NUM_TX_SAMPS}, {n_frames * NUM_RX_SAMPS})")
 
     graph, tx_streamer, rx_streamer, ofdm, radio = build_graph()
+
+    if live:
+        # Continuous mode: feed one frame / capture one frame and live-update the
+        # plot until the window is closed. Exits without the one-shot PASS/FAIL.
+        run_live(tx_streamer, rx_streamer, ofdm, radio, payload, expected)
+        sys.exit(0)
 
     captured = feed_enable_capture(tx_streamer, rx_streamer, ofdm, radio, payload)
     # Persist the raw capture so the captured-vs-golden relationship can be
@@ -532,9 +1024,15 @@ def main():
     if lock_ratio < 3.0:
         print("WARNING: weak envelope lock -- the capture may not be the golden OFDM "
               "waveform at all (check the block is fed the golden payload).")
-    if overlap_len < NUM_RX_SAMPS:
-        print(f"NOTE: only a partial frame was captured ({overlap_len}/{NUM_RX_SAMPS}); "
-              "raise RECV_BUFFERING to verify a full frame")
+    want = n_frames * NUM_RX_SAMPS
+    if overlap_len < want:
+        print(f"NOTE: only {overlap_len}/{want} samples were captured/aligned "
+              f"({overlap_len / NUM_RX_SAMPS:.2f} of {n_frames} frame(s)). The BLOCK "
+              "emits all requested frames; the loopback CAPTURE is bounded by the "
+              "radio-RX-FIFO one-shot ceiling (~54000 captured samples incl. gaps, "
+              "i.e. roughly 5 of these 8960-sample frames per run, fewer if the feed "
+              "lags and inter-frame gaps grow). Frames beyond the window are still "
+              "transmitted -- watch them on a scope/SA, or verify in smaller batches.")
 
     # Characterize the captured-vs-golden relationship (rotation / I-Q swap /
     # gain) and apply the testbench +-TOL_LSB criterion after gain correction.

@@ -17,3 +17,4 @@
 #add_subdirectory(rfnoc_block_myblock)
 
 add_subdirectory(rfnoc_block_ofdm_tx_sl)
+add_subdirectory(rfnoc_block_ofdm_rx_sl)

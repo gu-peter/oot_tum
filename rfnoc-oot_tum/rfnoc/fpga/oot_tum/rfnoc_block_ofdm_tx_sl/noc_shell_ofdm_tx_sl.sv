@@ -92,7 +92,7 @@ module noc_shell_ofdm_tx_sl #(
   output wire               axis_data_clk,
   output wire               axis_data_rst,
   // Data Stream to User Logic: txPayload
-  output wire [8*1-1:0]      m_txPayload_axis_tdata,
+  output wire [32*1-1:0]     m_txPayload_axis_tdata,
   output wire [1-1:0]        m_txPayload_axis_tkeep,
   output wire                m_txPayload_axis_tlast,
   output wire                m_txPayload_axis_tvalid,
@@ -246,7 +246,7 @@ module noc_shell_ofdm_tx_sl #(
 
   chdr_to_axis_data #(
     .CHDR_W         (CHDR_W),
-    .ITEM_W         (8),
+    .ITEM_W         (32),
     .NIPC           (1),
     .SYNC_CLKS      (0),
     .INFO_FIFO_SIZE ($clog2(32)),

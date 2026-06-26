@@ -6,3 +6,5 @@
 
 # Add one line for every image core here:
 RFNOC_REGISTER_IMAGE_CORE(SRC x440_X4_200_rfnoc_image_core_custom_ofdm.yml)
+RFNOC_REGISTER_IMAGE_CORE(SRC x440_X4_200_rfnoc_image_core_custom_ofdm_rx.yml)
+RFNOC_REGISTER_IMAGE_CORE(SRC x440_X4_200_rfnoc_image_core_custom_ofdm_txrx.yml)

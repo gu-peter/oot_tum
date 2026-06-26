@@ -75,13 +75,11 @@ module rfnoc_block_ofdm_tx_sl #(
   wire [31:0]        m_ctrlport_req_data;
   reg                m_ctrlport_resp_ack;
   reg  [31:0]        m_ctrlport_resp_data;
-  // Data Stream to User Logic: txPayload
-  // ILA debug: probe the payload bits as the core consumes them (ce_250 domain)
-  // to localize the data-dependent corruption -- if the consumed payload byte
-  // sequence (tdata when tvalid && tready, during data REs) matches the fed
-  // golden payload, the corruption is in the core/IFFT; if it jitters, it is the
-  // payload consumption/CDC handshake. mark_debug keeps these nets for the ILA.
-  (* mark_debug = "true" *) wire [8*1-1:0]     m_txPayload_axis_tdata;
+  // Data Stream to User Logic: txPayload (now a 32-bit packed item: 16 dibits
+  // per word, expanded to the core's 1-dibit-per-cycle stream by
+  // axis_dibit_unpack below). See that module + ofdm_tx_sl.yml for the rationale
+  // (full payload-bandwidth use and avoidance of the s8 item32 byte scramble).
+  wire [32*1-1:0]    m_txPayload_axis_tdata;
   wire [1-1:0]       m_txPayload_axis_tkeep;
   wire               m_txPayload_axis_tlast;
   (* mark_debug = "true" *) wire               m_txPayload_axis_tvalid;
@@ -315,6 +313,7 @@ module rfnoc_block_ofdm_tx_sl #(
   localparam REG_ENABLE_ADDR           = 1;
 
   wire txPayloadReady;
+  wire core_pl_ready;          // OFDM core txPayloadReady (low = >=1 frame buffered)
   reg  reg_enable = 1'b0;
   wire enable_axis_clk;
 
@@ -326,7 +325,7 @@ module rfnoc_block_ofdm_tx_sl #(
   ) txPayloadReady_sync_i (
     .clk (ctrlport_clk),
     .rst (ctrlport_rst),
-    .in  (m_txPayload_axis_tready),
+    .in  (core_pl_ready),
     .out (txPayloadReady)
   );
 
@@ -400,22 +399,28 @@ module rfnoc_block_ofdm_tx_sl #(
   //
   // Fix: only let the core run while a *full frame* of payload is buffered.
   // FWFT_FIFO drives txPayloadReady low once occupancy reaches one frame
-  // (fwft_logic_num_o >= 40812), so ~m_txPayload_axis_tready means "a complete
+  // (fwft_logic_num_o >= 4560), so ~core_pl_ready means "a complete
   // frame is queued". The core's 'enable' input *holds* the Frame_Counter when
   // low (it does not gate the payload push), so we can pause/resume the framer
   // at frame boundaries without losing buffered payload. We mirror the core's
   // Frame_Counter here -- identical advance condition (clk_enable & enable) and
   // reset -- so we know exactly when its framer sits at a frame boundary, and
   // gate 'enable' to start a frame only when one is fully buffered. Because a
-  // frame consumes exactly one frame of payload (179 data symbols x 228 = 40812)
+  // frame consumes exactly one frame of payload (20 data symbols x 228 = 4560)
   // and we start with that buffered, the FIFO can never underrun mid-frame.
   //
   // Frame geometry mirrors Frame_Counter: subcarrier counter wraps at 320
-  // (RE/symbol = FFT 256 + CP 64), symbol counter wraps at 240 (symbols/frame).
+  // (RE/symbol = FFT 256 + CP 64), symbol counter wraps at 28 (symbols/frame).
   localparam int RE_PER_SYM    = 320;
-  localparam int SYM_PER_FRAME = 240;
+  localparam int SYM_PER_FRAME = 28;
 
-  wire frame_buffered = ~m_txPayload_axis_tready;     // occupancy >= one frame
+  // Payload stream into the core, expanded from the 32-bit packed item by
+  // axis_dibit_unpack (instantiated just before the core, below).
+  localparam int DIBITS_PER_FRAME = 20*228;            // 4560 data dibits/frame
+  (* mark_debug = "true" *) wire [1:0] pl_dibit;        // unpacked dibit to core
+  (* mark_debug = "true" *) wire       pl_dvalid;       // unpacked dibit valid
+
+  wire frame_buffered = ~core_pl_ready;                // occupancy >= one frame
   (* mark_debug = "true" *) reg  run_frame = 1'b0;     // gated core enable
   // Same advance condition as the core's Frame_Counter (enb & enable).
   wire core_advance = s_txData_axis_tready & run_frame;
@@ -423,7 +428,7 @@ module rfnoc_block_ofdm_tx_sl #(
   // ILA: mirror counters give the RE/symbol position so a capture can be lined
   // up with which subcarrier/symbol each consumed payload byte belongs to.
   (* mark_debug = "true" *) reg [8:0] re_mirror  = '0;   // mirrors subcarrier_counter (0..319)
-  (* mark_debug = "true" *) reg [7:0] sym_mirror = '0;   // mirrors ofdm_symbol_counter (0..239)
+  (* mark_debug = "true" *) reg [7:0] sym_mirror = '0;   // mirrors ofdm_symbol_counter (0..27)
   wire last_re_of_frame = (re_mirror == RE_PER_SYM-1) &&
                           (sym_mirror == SYM_PER_FRAME-1);
 
@@ -463,26 +468,44 @@ module rfnoc_block_ofdm_tx_sl #(
   // consumption) whenever the output FIFO is full. No combinational loop:
   // s_txData_axis_tready comes from the registered FIFO fullness, not from
   // txValid. 'enable' is the frame-gated run_frame (see above).
+  // Expand each 32-bit packed payload word (16 dibits) into the core's
+  // 1-dibit-per-cycle stream, dropping the per-frame pad so exactly
+  // DIBITS_PER_FRAME dibits reach the core per frame. The unpacker's input-ready
+  // backpressures the NoC shell; the core's txPayloadReady (core_pl_ready)
+  // backpressures the unpacker.
+  axis_dibit_unpack #(
+    .DIBITS_PER_FRAME (DIBITS_PER_FRAME)
+  ) dibit_unpack_i (
+    .clk      (axis_data_clk),
+    .rst      (axis_data_rst_locked),
+    .s_tdata  (m_txPayload_axis_tdata),
+    .s_tvalid (m_txPayload_axis_tvalid),
+    .s_tready (m_txPayload_axis_tready),
+    .m_dibit  (pl_dibit),
+    .m_dvalid (pl_dvalid),
+    .m_dready (core_pl_ready)
+  );
+
   OFDM_Transmitter ofdm_transmitter_i (
     .clk            (axis_data_clk),
     .reset          (axis_data_rst_locked),
     .clk_enable     (s_txData_axis_tready),
     .enable         (run_frame),
-    .txPayload_0    (m_txPayload_axis_tdata[0]),
-    .txPayload_1    (m_txPayload_axis_tdata[1]),
+    .txPayload_0    (pl_dibit[0]),
+    .txPayload_1    (pl_dibit[1]),
     // Gate the payload-push with the AXI-Stream handshake. The OFDM core's
     // internal FWFT FIFO pushes on txPayloadValid alone and only honors
     // backpressure via txPayloadReady on its output. Without this gating the
-    // FIFO keeps accepting the upstream-held word every cycle while tready is
+    // FIFO keeps accepting the upstream-held word every cycle while ready is
     // low, pinning its occupancy at the full threshold so txPayloadReady never
     // re-asserts. ANDing valid with ready makes a sample push only when the
     // FIFO has room (proper AXI-Stream flow control).
-    .txPayloadValid (m_txPayload_axis_tvalid & m_txPayload_axis_tready),
+    .txPayloadValid (pl_dvalid & core_pl_ready),
     .ce_out         (),
     .txData_re      (s_txData_axis_tdata[31:16]),
     .txData_im      (s_txData_axis_tdata[15:0]),
     .txValid        (s_txData_axis_tvalid),
-    .txPayloadReady (m_txPayload_axis_tready)
+    .txPayloadReady (core_pl_ready)
   );
 
   // Packetize the OFDM output stream. The output framer (axis_data_to_chdr,
@@ -495,9 +518,17 @@ module rfnoc_block_ofdm_tx_sl #(
   // 32-bit item that is 2**MTU * 2 items, i.e. 2048 for MTU=10). Larger packets
   // mean less per-packet header/handshake overhead, so the downstream radio --
   // which consumes a sample every cycle at its fixed rate -- is far less likely
-  // to see inter-packet delivery gaps and underflow. 64 samples/packet is tiny
-  // (one CHDR header per 64 samples); 1024 cuts that overhead 16x.
-  localparam int OUT_SPP = 1024;
+  // to see inter-packet delivery gaps and underflow.
+  //
+  // OUT_SPP must also DIVIDE the per-frame output length (28 syms x 320 = 8960
+  // samples) so a frame ends exactly on a packet boundary. Since this framer only
+  // closes a packet on the OUT_SPP-th sample (no frame-boundary tlast), a frame
+  // whose length is not a multiple of OUT_SPP leaves a partial final packet
+  // stranded in the framer (never sent), starving the consumer. 8960 = 5 * 1792,
+  // and 1792 <= 2048 (MTU), so 1792 gives 5 whole packets/frame with the lowest
+  // per-packet overhead available. (The old 1024 only worked because the former
+  // 240-symbol frame of 76800 = 75 * 1024 happened to divide evenly.)
+  localparam int OUT_SPP = 1792;
 
   reg [$clog2(OUT_SPP)-1:0] out_samp_cnt = '0;
   always @(posedge axis_data_clk) begin
@@ -523,19 +554,18 @@ module rfnoc_block_ofdm_tx_sl #(
   // comes through correct on hardware, but an arbitrary (golden) payload yields
   // random, non-deterministic data subcarriers -- so the payload bits the core
   // consumes diverge from what was fed. Capture those bits in-situ:
-  //   probe0 = payload bits, probe1/2 = tvalid/tready (a byte is consumed when
-  //   both are high). probe3..5 = core output + backpressure (clk_enable =
-  //   s_txData_axis_tready). probe6 = run_frame (gated enable). probe7/8 =
-  //   RE/symbol position, so each consumed byte maps to its subcarrier/symbol.
-  // Trigger on run_frame rising (frame start); the consumed-byte sequence
-  // (probe0 sampled when probe1 && probe2) should equal the fed payload byte
-  // stream -- if it jitters, the bug is in payload consumption/CDC; if it is
-  // correct but the output is wrong, the bug is in the core/IFFT.
+  //   probe0 = unpacked dibit into the core, probe1/2 = dibit valid/ready (a
+  //   dibit is consumed when both are high). probe3..5 = core output +
+  //   backpressure (clk_enable = s_txData_axis_tready). probe6 = run_frame
+  //   (gated enable). probe7/8 = RE/symbol position, so each consumed dibit maps
+  //   to its subcarrier/symbol. Trigger on run_frame rising (frame start); the
+  //   consumed-dibit sequence (probe0 when probe1 && probe2) should equal the
+  //   fed payload dibits.
   ila_0 u_ila_txpayload (
     .clk    (axis_data_clk),
-    .probe0 (m_txPayload_axis_tdata[1:0]),
-    .probe1 (m_txPayload_axis_tvalid),
-    .probe2 (m_txPayload_axis_tready),
+    .probe0 (pl_dibit),
+    .probe1 (pl_dvalid),
+    .probe2 (core_pl_ready),
     .probe3 (s_txData_axis_tdata),
     .probe4 (s_txData_axis_tvalid),
     .probe5 (s_txData_axis_tready),

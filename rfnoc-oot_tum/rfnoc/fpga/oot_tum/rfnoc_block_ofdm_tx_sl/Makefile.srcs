@@ -18,6 +18,7 @@
 # infrastructure.
 RFNOC_BLOCK_OFDM_TX_SL_SRCS := $(addprefix $(dir $(abspath $(lastword $(MAKEFILE_LIST)))), \
 rfnoc_block_ofdm_tx_sl.sv \
+axis_dibit_unpack.sv \
 noc_shell_ofdm_tx_sl.sv \
 OFDM_Transmitter_pkg.sv \
 OFDM_Transmitter.sv \
